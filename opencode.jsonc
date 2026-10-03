@@ -1,0 +1,755 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "subagent_depth": 4,
+  "model": "opencode/big-pickle",
+  "agent": {
+    "basic": {
+      "model": "opencode-go/deepseek-v4-flash",
+      "description": "Default thinking agent. Escalate to @expert only when this struggles.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/plan.txt}",
+      "permission": {
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-fast": "allow",
+          "explore-fast-1": "allow",
+          "explore-fast-2": "allow",
+          "explore-fast-3": "allow",
+          "explore-fast-4": "allow",
+          "implement-fast": "allow",
+          "implement-fast-1": "allow",
+          "implement-fast-2": "allow",
+          "implement-fast-3": "allow",
+          "implement-fast-4": "allow"
+        }
+      }
+    },
+    "expert": {
+      "model": "opencode-go/glm-5.2",
+      "description": "Last resort for genuinely hard problems the fast tiers fail on. Untested in the 2026-09-20 head-to-head — first real escalation is effectively also its first benchmark. Most expensive agent (880 req/5h) — use deliberately.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/plan.txt}",
+      "permission": {
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-fast": "allow",
+          "explore-fast-1": "allow",
+          "explore-fast-2": "allow",
+          "explore-fast-3": "allow",
+          "explore-fast-4": "allow",
+          "implement-fast": "allow",
+          "implement-fast-1": "allow",
+          "implement-fast-2": "allow",
+          "implement-fast-3": "allow",
+          "implement-fast-4": "allow",
+          "explore-deep": "allow",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "explore-fast": {
+      "model": "opencode/big-pickle",
+      "description": "Default read-only codebase exploration. Free via Zen. Escalates to @explore-deep when stuck or looping.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-deep": "allow"
+        }
+      }
+    },
+    "explore-fast-1": {
+      "model": "opencode/big-pickle",
+      "description": "explore-fast primary pool variant on big-pickle (Zen, free). Load-equalized with explore-fast-2 by the agent-pool plugin — spawn 'explore-fast' instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-deep": "allow"
+        }
+      }
+    },
+    "explore-fast-2": {
+      "model": "opencode-go/space-bunny-free",
+      "description": "explore-fast primary pool variant on space-bunny-free (free, 1M context, on opencode-go so a Zen-wide limit cannot disable both primaries). Load-equalized with explore-fast-1 by the agent-pool plugin — spawn 'explore-fast' instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-deep": "allow"
+        }
+      }
+    },
+    "explore-fast-3": {
+      "model": "opencode/nemotron-3-ultra-free",
+      "description": "explore-fast overflow pool variant on nemotron-3-ultra-free (Zen, free, 1M context). Engaged by the agent-pool plugin only while both primary variants are already running ahead of it — spawn 'explore-fast' instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-deep": "allow"
+        }
+      }
+    },
+    "explore-fast-4": {
+      "model": "opencode-go/longcat-2.5-preview-free",
+      "description": "explore-fast overflow pool variant on longcat-2.5-preview-free (free, 1M context). On opencode-go on purpose so a Zen-wide free limit cannot disable three of four slots — spawn 'explore-fast' instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-deep": "allow"
+        }
+      }
+    },
+    "explore-deep": {
+      "model": "opencode-go/deepseek-v4-flash",
+      "description": "Last-resort read-only exploration for genuinely hard problems @explore-fast fails on. Most expensive explore tier — use deliberately.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/explore-deep.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "implement-fast": {
+      "model": "opencode/big-pickle",
+      "description": "Default agent that executes a finalized plan. Escalates to @implement-deep when stuck or looping.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "implement-deep": {
+      "model": "opencode-go/deepseek-v4-flash",
+      "description": "Last-resort executor for genuinely hard problems @implement-fast fails on. Most expensive implement tier — use deliberately.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-deep.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "context-manager": {
+      "model": "opencode/big-pickle",
+      "description": "Repository cartographer and memory maintainer. Bootstraps and incrementally maintains .opencode/context/ (architecture, contexts, conventions, workflows, decisions) as a small navigation map for future agents. Runs automatically after sessions that changed files; can also be invoked with /context-init, /context-update, /context-review. Never use it for general coding tasks.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/context-manager.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "write": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "ls": "allow",
+          "ls *": "allow",
+          "pwd": "allow",
+          "cat *": "allow",
+          "find *": "allow",
+          "fd *": "allow",
+          "tree *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "stat *": "allow",
+          "file *": "allow",
+          "du *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git ls-files*": "allow",
+          "git show*": "allow",
+          "git diff*": "allow",
+          "git blame*": "allow",
+          "git grep*": "allow",
+          "grep *": "allow",
+          "rg *": "allow",
+          "rg": "allow",
+          "echo *": "allow",
+          "sort*": "allow",
+          "uniq*": "allow",
+          "wc": "allow",
+          "which *": "allow",
+          "date": "allow",
+          "node -e *": "allow",
+          "python3 -c *": "allow",
+          "mkdir -p *": "deny"
+        },
+        "external_directory": {
+          "*": "deny",
+          "$HOME/.local/share/opencode/tool-output/*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "deny",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "implement-fast-1": {
+      "model": "opencode/big-pickle",
+      "description": "implement-fast pool slot 1 on big-pickle (Zen, free). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "implement-fast-2": {
+      "model": "opencode-go/space-bunny-free",
+      "description": "implement-fast pool slot 2 on space-bunny-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "implement-fast-3": {
+      "model": "opencode/nemotron-3-ultra-free",
+      "description": "implement-fast pool slot 3 on nemotron-3-ultra-free (Zen, free, 1M context). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "implement-fast-4": {
+      "model": "opencode-go/longcat-2.5-preview-free",
+      "description": "implement-fast pool slot 4 on longcat-2.5-preview-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.2,
+      "tools": {
+        "playwright_*": true
+      },
+      "prompt": "{file:./.opencode/prompts/implement-fast.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "implement-deep": "allow"
+        }
+      }
+    },
+    "context-manager-1": {
+      "model": "opencode/big-pickle",
+      "description": "context-manager pool slot 1 on big-pickle (Zen, free). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/context-manager.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "write": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "ls": "allow",
+          "ls *": "allow",
+          "pwd": "allow",
+          "cat *": "allow",
+          "find *": "allow",
+          "fd *": "allow",
+          "tree *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "stat *": "allow",
+          "file *": "allow",
+          "du *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git ls-files*": "allow",
+          "git show*": "allow",
+          "git diff*": "allow",
+          "git blame*": "allow",
+          "git grep*": "allow",
+          "grep *": "allow",
+          "rg *": "allow",
+          "rg": "allow",
+          "echo *": "allow",
+          "sort*": "allow",
+          "uniq*": "allow",
+          "wc": "allow",
+          "which *": "allow",
+          "date": "allow",
+          "node -e *": "allow",
+          "python3 -c *": "allow",
+          "mkdir -p *": "deny"
+        },
+        "external_directory": {
+          "*": "deny",
+          "$HOME/.local/share/opencode/tool-output/*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "deny",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "context-manager-2": {
+      "model": "opencode-go/space-bunny-free",
+      "description": "context-manager pool slot 2 on space-bunny-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/context-manager.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "write": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "ls": "allow",
+          "ls *": "allow",
+          "pwd": "allow",
+          "cat *": "allow",
+          "find *": "allow",
+          "fd *": "allow",
+          "tree *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "stat *": "allow",
+          "file *": "allow",
+          "du *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git ls-files*": "allow",
+          "git show*": "allow",
+          "git diff*": "allow",
+          "git blame*": "allow",
+          "git grep*": "allow",
+          "grep *": "allow",
+          "rg *": "allow",
+          "rg": "allow",
+          "echo *": "allow",
+          "sort*": "allow",
+          "uniq*": "allow",
+          "wc": "allow",
+          "which *": "allow",
+          "date": "allow",
+          "node -e *": "allow",
+          "python3 -c *": "allow",
+          "mkdir -p *": "deny"
+        },
+        "external_directory": {
+          "*": "deny",
+          "$HOME/.local/share/opencode/tool-output/*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "deny",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "context-manager-3": {
+      "model": "opencode/nemotron-3-ultra-free",
+      "description": "context-manager pool slot 3 on nemotron-3-ultra-free (Zen, free, 1M context). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/context-manager.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "write": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "ls": "allow",
+          "ls *": "allow",
+          "pwd": "allow",
+          "cat *": "allow",
+          "find *": "allow",
+          "fd *": "allow",
+          "tree *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "stat *": "allow",
+          "file *": "allow",
+          "du *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git ls-files*": "allow",
+          "git show*": "allow",
+          "git diff*": "allow",
+          "git blame*": "allow",
+          "git grep*": "allow",
+          "grep *": "allow",
+          "rg *": "allow",
+          "rg": "allow",
+          "echo *": "allow",
+          "sort*": "allow",
+          "uniq*": "allow",
+          "wc": "allow",
+          "which *": "allow",
+          "date": "allow",
+          "node -e *": "allow",
+          "python3 -c *": "allow",
+          "mkdir -p *": "deny"
+        },
+        "external_directory": {
+          "*": "deny",
+          "$HOME/.local/share/opencode/tool-output/*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "deny",
+        "task": {
+          "*": "deny"
+        }
+      }
+    },
+    "context-manager-4": {
+      "model": "opencode-go/longcat-2.5-preview-free",
+      "description": "context-manager pool slot 4 on longcat-2.5-preview-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "mode": "subagent",
+      "hidden": true,
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/context-manager.txt}",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "write": {
+          "*": "deny",
+          ".opencode/context/**": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "ls": "allow",
+          "ls *": "allow",
+          "pwd": "allow",
+          "cat *": "allow",
+          "find *": "allow",
+          "fd *": "allow",
+          "tree *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "stat *": "allow",
+          "file *": "allow",
+          "du *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git ls-files*": "allow",
+          "git show*": "allow",
+          "git diff*": "allow",
+          "git blame*": "allow",
+          "git grep*": "allow",
+          "grep *": "allow",
+          "rg *": "allow",
+          "rg": "allow",
+          "echo *": "allow",
+          "sort*": "allow",
+          "uniq*": "allow",
+          "wc": "allow",
+          "which *": "allow",
+          "date": "allow",
+          "node -e *": "allow",
+          "python3 -c *": "allow",
+          "mkdir -p *": "deny"
+        },
+        "external_directory": {
+          "*": "deny",
+          "$HOME/.local/share/opencode/tool-output/*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "deny",
+        "task": {
+          "*": "deny"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@playwright/mcp"
+      ],
+      "enabled": true
+    }
+  },
+  "tools": {
+    "playwright_*": false
+  },
+  "provider": {
+    "opencode": {
+      "whitelist": [
+        "big-pickle",
+        "nemotron-3-ultra-free"
+      ]
+    },
+    "opencode-go": {
+      "whitelist": [
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "longcat-2.5-preview-free",
+        "space-bunny-free"
+      ]
+    }
+  }
+}

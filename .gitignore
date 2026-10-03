@@ -1,0 +1,11 @@
+node_modules/
+bun.lock
+*.log
+
+# Credentials never belong here. opencode keeps auth in
+# ~/.local/share/opencode/auth.json, outside this directory, but guard anyway.
+auth.json
+.env
+.env.*
+*.pem
+*.key
