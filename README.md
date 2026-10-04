@@ -123,8 +123,9 @@ error shape opencode never actually emits.
   opencode server. There is no systemd unit or tmux session — they are foreground
   processes, so restart each in its own terminal.
 - `auth.json` lives in `~/.local/share/opencode/`, **not** in this repo.
-- `@opencode-ai/plugin` is pinned; dev-host currently runs 1.17.9 while this repo and
-  dev-host are on 1.16.2, and the plugin is verified against 1.16.2.
+- `@opencode-ai/plugin` is pinned. The pool was verified against **1.16.2**; a host
+  running a newer SDK may work but is untested — check `package.json` on each machine
+  before assuming parity.
 - My `oc-sync` script distributes this setup to remote hosts (`--with-config` also
   pushes `lib/`, which the plugins import). It lives outside this repo since it is
   host-specific.
