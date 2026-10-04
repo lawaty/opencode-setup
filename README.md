@@ -139,4 +139,11 @@ with remaining seconds, and a per-process breakdown:
 slot 1 primary  opencode/big-pickle  load=2  [explore-fastx1 context-managerx1]
 slot 2 primary  opencode-go/space-bunny-free  load=1  [implement-fastx1]
 slot 3 overflow opencode/nemotron-3-ultra-free  load=0  [idle]
+
+watchdog alive: last sweep 4s ago (every 30s).
 ```
+
+The `watchdog alive` line is the cheap way to confirm the reaper is actually running
+without waiting for a hang — the reaper logs nothing when it finds nothing, so a silent
+log is not evidence of a dead timer. Each process also logs one `reaper armed` line at
+startup.

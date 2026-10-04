@@ -102,6 +102,7 @@ type State = {
   activity: Map<string, number>
   reaped: number
   reaping: boolean
+  lastSweep: number
   id: string
   dir: string
 }
@@ -127,6 +128,7 @@ export function state(opts: { id?: string; dir?: string } = {}): State {
       activity: new Map(),
       reaped: 0,
       reaping: false,
+      lastSweep: 0,
       id,
       dir,
     }

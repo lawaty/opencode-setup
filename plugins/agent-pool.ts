@@ -69,6 +69,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
   const reapStuck = async () => {
     if (s.reaping) return
     s.reaping = true
+    s.lastSweep = Date.now()
     try {
       const stuck = pool.findStuck(s)
       if (stuck.length === 0) return
@@ -98,9 +99,14 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
   // also runs once at startup so a task left hanging by a previous process is
   // cleaned up rather than waiting a full interval.
   pool.refreshCatalog(s, serverUrl)
+  const reapMs = opts.reapMs ?? REAP_INTERVAL_MS
   void reapStuck()
-  const timer = setInterval(() => void reapStuck(), opts.reapMs ?? REAP_INTERVAL_MS)
+  const timer = setInterval(() => void reapStuck(), reapMs)
   timer.unref?.()
+  void log(
+    "info",
+    `reaper armed: every ${Math.round(reapMs / 1000)}s, aborts a claim older than ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}m whose target has been silent ${Math.round(pool.STUCK_IDLE_MS / 60000)}m`,
+  )
 
   return {
     config: async (cfg) => {
@@ -270,6 +276,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
               "",
               `${total} claim(s) in flight across ${snap.siblings.length + 1} process(es).`,
               `hung past ${Math.round(pool.STUCK_MIN_AGE_MS / 60000)}min with ${Math.round(pool.STUCK_IDLE_MS / 60000)}min silence: ${hung} (auto-aborted); reaped total: ${s.reaped}.`,
+              `watchdog alive: last sweep ${s.lastSweep ? `${Math.max(0, Math.round((now - s.lastSweep) / 1000))}s ago` : "never"} (every ${Math.round(reapMs / 1000)}s).`,
               coolingNow.length === 0
                 ? "no models cooling down."
                 : `cooling: ${coolingNow.map(([m, st]) => `${m} for ${Math.ceil((st.until - now) / 1000)}s`).join(", ")}`,
