@@ -17,7 +17,7 @@ and how the pieces are distributed.
 | `~/bin/oc-sync` | distributes this setup to the two remote hosts (outside the repo, host-specific) |
 | `~/.local/share/opencode/agent-pool/` | live cross-process claims + cooldowns |
 | `~/.local/share/opencode/auth.json` | credentials — deliberately **outside** this repo |
-| `~/.opencode/context/` | the context map for `/home/yourname` (see below) |
+| `~/.opencode/context/` | this project's context map — derived, not in git (see below) |
 
 ## Health checks
 
@@ -73,9 +73,17 @@ the next sync.
 
 ## The context map
 
-`context-autoupdate` maintains a five-file map per project at `.opencode/context/`.
-For `/home/yourname` that is `~/.opencode/context/`, which is **not** inside this repo
-and is **not** synced to the other hosts — see [Version control](#version-control).
+`context-autoupdate` maintains a five-file map per project at `.opencode/context/`,
+resolved from the session's own directory (`path.resolve(directory)`). So
+`/home/yourname` gets `~/.opencode/context/`, and a different project gets its own.
+
+It is deliberately **not** in git and **not** synced to the other hosts. The map is a
+derived artifact — an index regenerated from the source by `context-manager`, not source
+itself — and it is scoped to one machine's filesystem. Syncing it would push a
+description of this host's projects onto hosts that have different ones, and committing it
+would churn on every session that touches a file. Git holds the rules that generate it
+(`AGENTS.md`, `rules/context-protocol.md`, `commands/context-*.md`, the plugin, the tests);
+the map itself is rebuilt on demand by the next cartographer run.
 
 Trigger: a root session goes idle after editing files outside the map. It borrows a pool
 slot, spawns `context-manager`, and applies changes. `context-manager` is the single
@@ -101,8 +109,8 @@ This repo (`~/.config/opencode`) is a git repository, public at
 
 Not covered by git:
 
-- **The context map** (`~/.opencode/context/`) — unversioned and unsynced. It is the only
-  part of the system with no backup.
+- **The context map** (`~/.opencode/context/`) — intentionally outside git and not synced.
+  Derived, per-project, and rebuilt on demand; see [The context map](#the-context-map).
 - `~/bin/oc-sync` and `~/.oc-hosts` — host-specific, outside the repo deliberately.
 - The remote hosts — rsync copies, no history.
 
