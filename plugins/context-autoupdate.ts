@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
 import * as path from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
@@ -35,6 +35,69 @@ const IGNORED_SEGMENTS = new Set([
 
 const toPosix = (value: string) => value.split(path.sep).join("/")
 
+// A cartographer that cannot write reports success anyway: prompt() resolves, no
+// error is raised, and the run logs "finished". That is how the map sat stale for
+// three days while every run claimed it had applied changes -- the one-writer
+// permission rule silently matched nothing. Count what actually changed on disk
+// instead of what was offered to it, so a blocked run is distinguishable.
+const snapshotMap = (dir: string) => {
+  const out = new Map<string, string>()
+  try {
+    for (const name of readdirSync(dir)) {
+      const file = path.join(dir, name)
+      try {
+        const st = statSync(file)
+        if (st.isFile()) out.set(name, `${st.size}:${st.mtimeMs}`)
+      } catch {}
+    }
+  } catch {}
+  return out
+}
+
+const changedSince = (before: Map<string, string>, dir: string) => {
+  const after = snapshotMap(dir)
+  let changed = 0
+  for (const [name, stamp] of after) if (before.get(name) !== stamp) changed++
+  for (const name of before.keys()) if (!after.has(name)) changed++
+  return changed
+}
+
+// Verifies the one-writer permission rule actually matches this project's map.
+// opencode compiles permission patterns to anchored regexes (* -> .*) and matches
+// them against the RESOLVED ABSOLUTE path, so a rule written relative to the
+// project root never fires. Reproduced here so a malformed rule is reported at
+// startup instead of discovered weeks later as a silently stale map.
+export const verifyWriterRule = (configPath: string, mapDir: string) => {
+  let raw: string
+  try {
+    raw = readFileSync(configPath, "utf8")
+  } catch {
+    return undefined // no config to inspect (custom config path, or stripped deploy)
+  }
+  const compile = (pattern: string) => {
+    const escaped = toPosix(pattern)
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".")
+    return new RegExp(`^${escaped}$`, "s")
+  }
+  const rules: string[] = []
+  for (const block of raw.matchAll(/"(edit|write)"\s*:\s*\{([^}]*)\}/g)) {
+    for (const rule of block[2].matchAll(/"((?:[^"\\]|\\.)*)"\s*:\s*"(allow|ask|deny)"/g)) {
+      if (rule[2] === "allow") rules.push(rule[1].replace(/\\"/g, '"'))
+    }
+  }
+  if (rules.length === 0) return undefined
+  const sample = toPosix(path.join(mapDir, "architecture.md"))
+  // Absolute only. Testing the relative form too would let the broken rule pass
+  // by matching a path opencode never evaluates.
+  const matching = rules.filter((rule) => compile(rule).test(sample))
+  if (matching.length > 0) return undefined
+  const relativeOnly = rules.filter((rule) => !rule.includes("/"))
+  return `context map is not writable: none of the allow rules in ${path.basename(configPath)} match ${sample}. Rules seen: ${rules.map((r) => `"${r}"`).join(", ")}. Pattern a leading "*/" onto the allow rule (opencode matches the resolved ABSOLUTE path, so "${CONTEXT_DIR}/**" alone never matches).`
+    + (relativeOnly.length > 0 ? ` Affected: ${relativeOnly.map((r) => `"${r}"`).join(", ")}.` : "")
+}
+
 export const ContextAutoUpdate = (async ({ client, directory }) => {
   const pending = new Set<string>()
   const owned = new Map<string, number>()
@@ -46,6 +109,11 @@ export const ContextAutoUpdate = (async ({ client, directory }) => {
 
   const root = path.resolve(directory)
   const contextAbs = path.join(root, CONTEXT_DIR)
+
+  // Fail loudly and immediately rather than weeks later as a silently stale map.
+  const here = (import.meta as { dir?: string }).dir ?? path.dirname(new URL(import.meta.url).pathname)
+  const writerProblem = verifyWriterRule(path.resolve(here, "..", "opencode.jsonc"), contextAbs)
+  if (writerProblem) void log("error", writerProblem)
 
   const isTracked = (file: string) => {
     const absolute = path.resolve(root, file)
@@ -161,6 +229,7 @@ export const ContextAutoUpdate = (async ({ client, directory }) => {
         // starts. Nothing before this point should delay a retry.
         lastRun = Date.now()
         owned.set(target, Date.now())
+        const before = snapshotMap(contextAbs)
         client.session
           .prompt({
             path: { id: target },
@@ -182,7 +251,20 @@ export const ContextAutoUpdate = (async ({ client, directory }) => {
               })
               return
             }
-            await log("info", `auto ${mode} finished`, { sessionID: target, files: files.length })
+            // Report what landed on disk, not what was offered to the cartographer.
+            // A run that was blocked from writing resolves exactly like one that
+            // succeeded, so the file count is the only honest signal available.
+            const changed = changedSince(before, contextAbs)
+            if (changed > 0) {
+              await log("info", `auto ${mode} finished`, { sessionID: target, considered: files.length, changed })
+            } else {
+              await log("warn", `auto ${mode} finished without changing the map`, {
+                sessionID: target,
+                considered: files.length,
+                changed: 0,
+                hint: "either nothing needed updating, or the cartographer could not write -- check the one-writer permission rule",
+              })
+            }
           })
           .catch(async (error) => {
             pool.release(state, claimKey)

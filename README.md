@@ -90,7 +90,7 @@ plugins/agent-pool.ts     hooks: task routing, limit detection, hang reaper, poo
 plugins/context-autoupdate.ts
                           keeps .opencode/context/ current; borrows a pool slot
 .opencode/prompts/        per-agent prompts
-tests/                    5 test suites, no network needed
+tests/                    6 test suites, no network needed
 ```
 
 `lib/pool.ts` lives outside `plugins/` on purpose: opencode loads everything in
@@ -107,12 +107,20 @@ node tests/pool-limits-test.mjs # cooldowns, backoff, stated resets, degraded mo
 node tests/pool-hang-test.mjs   # hang detection, abort, never killing live work
 node tests/pool-shared-test.mjs # slots shared across base agent types
 node tests/pool-timer-test.mjs  # reaper on a timer with no new spawns
+node tests/permission-test.mjs  # the one-writer rule actually matches the map path
 ```
 
 `pool-timer-test.mjs` and the `AI_APICallError` cases in `pool-limits-test.mjs` are
 regressions for two bugs that reached production: the reaper originally ran only on the
 next task spawn (a hung task survived 18 minutes), and limit detection only matched an
 error shape opencode never actually emits.
+
+`permission-test.mjs` covers a third: the context map could not be written at all,
+because the one-writer rule was `.opencode/context/**` while opencode matches the
+**resolved absolute** path. `prompt()` resolves either way, so a fully blocked run
+logged `finished files=4` while changing nothing, and the map sat stale for days.
+`context-autoupdate.ts` now checks the rule at startup and reports how many map files
+actually changed on disk, rather than how many it offered the cartographer.
 
 `tests/models-snapshot.json` pins the free-cost proof; refresh it with
 `curl -sS https://models.dev/api.json`.
