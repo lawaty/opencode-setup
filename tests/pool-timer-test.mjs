@@ -1,9 +1,8 @@
-// Regression tests for two production failures:
-//   1. the hang reaper only ran on the next task spawn, so a task that hung while
-//      the session was idle was never reaped (observed: 18 minutes, slot held)
-//   2. limit detection missed a real AI_APICallError because the error text was
-//      not where the old code looked
-// Also covers the provider-wide free_tier_limit signal opencode reports itself.
+// Regression tests for the production failure where the hang reaper only ran on the
+// next task spawn, so a task that hung while the session was idle was never reaped
+// (observed: 18 minutes, slot held). Also covers the provider-wide free_tier_limit
+// signal opencode reports itself, and the AI_APICallError limit-detection case that
+// pool-limits-test.mjs owns.
 // Run: node ~/.config/opencode/tests/pool-timer-test.mjs
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
