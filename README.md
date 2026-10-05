@@ -127,8 +127,10 @@ actually changed on disk, rather than how many it offered the cartographer.
 
 ## Operational notes
 
+- **Day-to-day reference: [OPERATIONS.md](OPERATIONS.md)** — health checks, restart
+  rules, deploying to the other hosts, the context map, and what is not under version control.
 - **Plugins are not hot-reloaded.** Every change here needs a restart of each running
-  opencode server. There is no systemd unit or tmux session — they are foreground
+  opencode process. There is no systemd unit or tmux session — they are foreground
   processes, so restart each in its own terminal.
 - `auth.json` lives in `~/.local/share/opencode/`, **not** in this repo.
 - `@opencode-ai/plugin` is pinned. The pool was verified against **1.16.2**; a host
