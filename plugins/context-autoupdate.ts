@@ -1,12 +1,13 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
+import { existsSync, readdirSync, statSync } from "node:fs"
 import * as path from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
+import { verifyWriterRule } from "../lib/writer-rule.ts"
 
 // Auto-maintains .opencode/context/ in every project.
 //
 // Trigger: a root session goes idle AND files outside .opencode/context/ were
-// edited since the last run. v1.18.33 has no "repo opened" or
+// edited since the last run. v1.18.34 has no "repo opened" or
 // "session.completed" event, so this approximates the requested lifecycle:
 // bootstrap when the map is missing, incremental update when it exists.
 
@@ -62,41 +63,10 @@ const changedSince = (before: Map<string, string>, dir: string) => {
   return changed
 }
 
-// Verifies the one-writer permission rule actually matches this project's map.
-// opencode compiles permission patterns to anchored regexes (* -> .*) and matches
-// them against the RESOLVED ABSOLUTE path, so a rule written relative to the
-// project root never fires. Reproduced here so a malformed rule is reported at
-// startup instead of discovered weeks later as a silently stale map.
-export const verifyWriterRule = (configPath: string, mapDir: string) => {
-  let raw: string
-  try {
-    raw = readFileSync(configPath, "utf8")
-  } catch {
-    return undefined // no config to inspect (custom config path, or stripped deploy)
-  }
-  const compile = (pattern: string) => {
-    const escaped = toPosix(pattern)
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*/g, ".*")
-      .replace(/\?/g, ".")
-    return new RegExp(`^${escaped}$`, "s")
-  }
-  const rules: string[] = []
-  for (const block of raw.matchAll(/"(edit|write)"\s*:\s*\{([^}]*)\}/g)) {
-    for (const rule of block[2].matchAll(/"((?:[^"\\]|\\.)*)"\s*:\s*"(allow|ask|deny)"/g)) {
-      if (rule[2] === "allow") rules.push(rule[1].replace(/\\"/g, '"'))
-    }
-  }
-  if (rules.length === 0) return undefined
-  const sample = toPosix(path.join(mapDir, "architecture.md"))
-  // Absolute only. Testing the relative form too would let the broken rule pass
-  // by matching a path opencode never evaluates.
-  const matching = rules.filter((rule) => compile(rule).test(sample))
-  if (matching.length > 0) return undefined
-  const relativeOnly = rules.filter((rule) => !rule.includes("/"))
-  return `context map is not writable: none of the allow rules in ${path.basename(configPath)} match ${sample}. Rules seen: ${rules.map((r) => `"${r}"`).join(", ")}. Pattern a leading "*/" onto the allow rule (opencode matches the resolved ABSOLUTE path, so "${CONTEXT_DIR}/**" alone never matches).`
-    + (relativeOnly.length > 0 ? ` Affected: ${relativeOnly.map((r) => `"${r}"`).join(", ")}.` : "")
-}
+// NOTE: this module must export the plugin and nothing else. opencode treats
+// every export of a plugin file as a plugin, calls it with the plugin input, and
+// uses the return value as a hooks object. A stray export that returns undefined
+// poisons the shared hook registry and breaks every hook dispatch in the process.
 
 export const ContextAutoUpdate = (async ({ client, directory }) => {
   const pending = new Set<string>()
@@ -112,7 +82,7 @@ export const ContextAutoUpdate = (async ({ client, directory }) => {
 
   // Fail loudly and immediately rather than weeks later as a silently stale map.
   const here = (import.meta as { dir?: string }).dir ?? path.dirname(new URL(import.meta.url).pathname)
-  const writerProblem = verifyWriterRule(path.resolve(here, "..", "opencode.jsonc"), contextAbs)
+  const writerProblem = verifyWriterRule(path.resolve(here, "..", "opencode.jsonc"), contextAbs, root)
   if (writerProblem) void log("error", writerProblem)
 
   const isTracked = (file: string) => {

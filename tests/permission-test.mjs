@@ -1,22 +1,41 @@
 // Regression tests for the silent-stale-map failure.
 //
-// context-autoupdate reported "auto update finished files=4" on 2026-10-04 while
-// writing nothing. The one-writer permission rule was ".opencode/context/**", but
-// opencode compiles permission patterns to anchored regexes (* -> .*) and matches
-// them against the RESOLVED ABSOLUTE path, so that rule could never fire. Every
-// write was denied, and prompt() still resolved, so a completely blocked run was
-// indistinguishable from a successful one and the map sat stale for days.
+// Two rounds of this bug, opposite fixes, both invisible:
 //
-// These tests pin the detector that turns that class of bug into a startup error.
+//   1. The one-writer rule was ".opencode/context/**". The plugin verified it against
+//      the ABSOLUTE path, concluded the rule was fine, and every write was denied.
+//      prompt() still resolved, so a fully blocked run was indistinguishable from a
+//      successful one and the map sat stale for days.
+//
+//   2. The rule was changed to "*/.opencode/context/**" to match the absolute path.
+//      That fixed the verifier and broke the writes again, because opencode does not
+//      evaluate the absolute path at all -- see below.
+//
+// opencode evaluates a file permission against the path RELATIVE TO THE PROJECT ROOT.
+// Handing the write tool /repo/.opencode/context/architecture.md is logged and evaluated
+// as ".opencode/context/architecture.md". Patterns compile to anchored regexes (* -> .*)
+// and the longest match wins, so:
+//
+//   ".opencode/context/**"    fires for a normally-rooted project, but not when the
+//                             project root is "/" (where the form is home/.../...)
+//   "*/.opencode/context/**"  fires only when the project root is "/"
+//
+// Both forms are therefore required. These tests pin the detector that turns this class
+// of bug into a startup error instead of a silently stale map.
 //
 // Run: node ~/.config/opencode/tests/permission-test.mjs
 import { strict as assert } from "node:assert"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { verifyWriterRule } from "../plugins/context-autoupdate.ts"
+import { verifyWriterRule } from "../lib/writer-rule.ts"
 
-const MAP = "/home/yourname/.opencode/context"
+const REL = '".opencode/context/**":"allow"'
+const ABS = '"*/.opencode/context/**":"allow"'
+// This repo, and this repo as seen from a project root of "/".
+const REPO = "/home/yourname/.config/opencode"
+const REPO_MAP = `${REPO}/.opencode/context`
+
 const dir = mkdtempSync(join(tmpdir(), "pool-perm-"))
 const config = (rules) => {
   const file = join(dir, "opencode.jsonc")
@@ -34,40 +53,71 @@ const ok = (name) => {
 }
 
 try {
-  // The fix: a leading */ is required because the matched path is absolute.
-  assert.equal(verifyWriterRule(config('"*/.opencode/context/**":"allow"'), MAP), undefined)
-  ok('leading "*/" rule matches the absolute map path')
+  // A normally-rooted project is evaluated on the relative form, so the relative rule works.
+  assert.equal(verifyWriterRule(config(REL), REPO_MAP, REPO), undefined)
+  ok('relative ".opencode/context/**" matches the project-root-relative map path')
 
-  // The original bug: relative-only rule matches nothing.
-  const broken = verifyWriterRule(config('".opencode/context/**":"allow"'), MAP)
-  assert.ok(broken, "relative-only rule must be reported as broken")
-  ok('relative-only ".opencode/context/**" is reported as broken')
+  // The rule that broke it: anchored with a leading "*/", so it never fires for a
+  // normally-rooted project. The old detector called this correct.
+  const broken = verifyWriterRule(config(ABS), REPO_MAP, REPO)
+  assert.ok(broken, 'absolute-only "*/" rule must be reported as broken')
+  ok('absolute-only "*/.opencode/context/**" is reported as broken')
   assert.match(broken, /not writable/)
   assert.match(broken, /none of the allow rules/)
-  ok("broken message states the map is not writable")
+  assert.match(broken, /RELATIVE TO THE PROJECT ROOT/, "message should state the real cause")
+  ok("broken message states the map is not writable and the real cause")
   assert.match(broken, /\.opencode\/context\/\*\*/, "message should name the offending rule")
-  assert.match(broken, /leading "\*\/"/, "message should state the fix")
+  assert.match(broken, /Allow both forms/, "message should state the fix")
   ok("broken message names the offending rule and the fix")
 
+  // …but that same rule IS correct when the project root is "/", because the evaluated
+  // form is then "home/lawaty/.opencode/context/architecture.md".
+  assert.equal(verifyWriterRule(config(ABS), REPO_MAP, "/"), undefined)
+  ok('absolute "*/" rule accepted when the project root is "/"')
+
+  // Symmetrically, the relative rule is wrong for a project rooted at "/".
+  assert.ok(verifyWriterRule(config(REL), REPO_MAP, "/"), 'relative-only rule must fail at root "/"')
+  ok('relative-only rule is reported as broken when the project root is "/"')
+
+  // What this repo actually ships: both forms, so every project root is covered.
+  assert.equal(verifyWriterRule(config(`${REL},${ABS}`), REPO_MAP, REPO), undefined)
+  assert.equal(verifyWriterRule(config(`${REL},${ABS}`), REPO_MAP, "/"), undefined)
+  assert.equal(verifyWriterRule(config(`${REL},${ABS}`), "/srv/work/app/.opencode/context", "/srv/work/app"), undefined)
+  ok("both rules together cover every project root")
+
   // A deny for the map must not be mistaken for an allow.
-  assert.equal(verifyWriterRule(config('".opencode/context/**":"deny"'), MAP), undefined)
+  assert.equal(verifyWriterRule(config('".opencode/context/**":"deny"'), REPO_MAP, REPO), undefined)
   ok("deny-only rules are ignored (no allow rule to match, nothing to break)")
 
   // No config, or no allow rules at all: stay silent rather than cry wolf.
-  assert.equal(verifyWriterRule(join(dir, "absent.jsonc"), MAP), undefined)
+  assert.equal(verifyWriterRule(join(dir, "absent.jsonc"), REPO_MAP, REPO), undefined)
   ok("missing config file does not raise a false alarm")
-  assert.equal(verifyWriterRule(config('"*":"allow"'), MAP), undefined)
+  assert.equal(verifyWriterRule(config('"*":"allow"'), REPO_MAP, REPO), undefined)
   ok("catch-all allow rule is accepted")
 
-  // The detector must track the real opencode.jsonc, not a fixture. If the live
-  // config ever regresses to a relative pattern, this fails on the spot.
-  const live = verifyWriterRule(new URL("../opencode.jsonc", import.meta.url).pathname, MAP)
-  assert.equal(live, undefined, `live config is not writable: ${live}`)
-  ok("live opencode.jsonc one-writer rule matches this project's map")
+  // No project root given: fall back to the absolute check rather than guessing.
+  assert.equal(verifyWriterRule(config(ABS), REPO_MAP), undefined)
+  ok("absolute check still used when no project root is supplied")
 
-  // …and on every host, since the rule must not be tied to one absolute path.
-  for (const other of ["/root/.opencode/context", "/srv/work/app/.opencode/context"]) {
-    assert.equal(verifyWriterRule(new URL("../opencode.jsonc", import.meta.url).pathname, other), undefined)
+  // The detector must track the real opencode.jsonc, not a fixture. If the live config
+  // ever drops either form, this fails on the spot.
+  const live = new URL("../opencode.jsonc", import.meta.url).pathname
+  for (const [root, map] of [
+    [REPO, REPO_MAP],
+    ["/", "/home/yourname/.opencode/context"],
+    ["/srv/work/app", "/srv/work/app/.opencode/context"],
+  ]) {
+    const result = verifyWriterRule(live, map, root)
+    assert.equal(result, undefined, `live config not writable for root ${root}: ${result}`)
+  }
+  ok("live opencode.jsonc is writable for every project root")
+
+  // …and on every host, since the rules must not be tied to one absolute path.
+  for (const [root, map] of [
+    ["/root", "/root/.opencode/context"],
+    ["/srv/work/app", "/srv/work/app/.opencode/context"],
+  ]) {
+    assert.equal(verifyWriterRule(live, map, root), undefined)
   }
   ok("rule is host-independent (matches /root and /srv maps too)")
 

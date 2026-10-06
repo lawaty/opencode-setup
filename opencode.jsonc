@@ -272,11 +272,13 @@
         "list": "allow",
         "edit": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "write": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "bash": {
           "*": "deny",
@@ -440,11 +442,13 @@
         "list": "allow",
         "edit": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "write": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "bash": {
           "*": "deny",
@@ -504,11 +508,13 @@
         "list": "allow",
         "edit": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "write": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "bash": {
           "*": "deny",
@@ -568,11 +574,13 @@
         "list": "allow",
         "edit": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "write": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "bash": {
           "*": "deny",
@@ -632,11 +640,13 @@
         "list": "allow",
         "edit": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "write": {
           "*": "deny",
-          "*/.opencode/context/**": "allow"
+          "*/.opencode/context/**": "allow",
+          ".opencode/context/**": "allow"
         },
         "bash": {
           "*": "deny",
