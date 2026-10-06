@@ -85,6 +85,7 @@ routing reads every sibling file. Cooldowns are one file per model for the same 
 
 ```
 opencode.jsonc            agents, permissions, provider whitelists (no pool models)
+bin/oc, bin/oc-sync       launcher and deploy script; hosts come from the gitignored .env
 pool-models.json          the pool's models and tiers -- the file you edit
 lib/pool.ts               shared pool state + slot decision (imported by both plugins)
 lib/writer-rule.ts        startup check that the one-writer permission rule fires
@@ -156,9 +157,10 @@ owns the list, the config hook derives everything else from it, and the tests fa
   SDK and the runtime agree; a mismatch is silent, since only `tool()` is called at runtime
   and nothing type-checks in production. Check `package.json` on each machine before
   assuming parity.
-- My `oc-sync` script distributes this setup to remote hosts (`--with-config` also
-  pushes `lib/`, which the plugins import). It lives outside this repo since it is
-  host-specific.
+- `bin/oc-sync` distributes this setup to remote hosts (`--with-config` also pushes
+  `lib/`, which the plugins import). The script lives in the repo; host names, addresses
+  and usernames live in `.env`, which is gitignored. `.env.example` is the template and
+  `~/bin/oc-sync` is a symlink to the repo copy.
 
 ## Inspecting it at runtime
 

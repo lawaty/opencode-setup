@@ -5,7 +5,7 @@
   "agent": {
     "basic": {
       "model": "opencode-go/deepseek-v4-flash",
-      "description": "Default thinking agent. Escalate to @expert only when this struggles.",
+      "description": "Default thinking agent. Read-only by design: it may only delegate to explore-fast* / implement-fast* and ask questions. expert is deliberately NOT spawnable from here (root sessions only), so do not promise that escalation.",
       "mode": "subagent",
       "temperature": 0.1,
       "prompt": "{file:./.opencode/prompts/plan.txt}",
@@ -22,16 +22,8 @@
         "question": "allow",
         "task": {
           "*": "deny",
-          "explore-fast": "allow",
-          "explore-fast-1": "allow",
-          "explore-fast-2": "allow",
-          "explore-fast-3": "allow",
-          "explore-fast-4": "allow",
-          "implement-fast": "allow",
-          "implement-fast-1": "allow",
-          "implement-fast-2": "allow",
-          "implement-fast-3": "allow",
-          "implement-fast-4": "allow"
+          "explore-fast*": "allow",
+          "implement-fast*": "allow"
         }
       }
     },
@@ -54,16 +46,8 @@
         "question": "allow",
         "task": {
           "*": "deny",
-          "explore-fast": "allow",
-          "explore-fast-1": "allow",
-          "explore-fast-2": "allow",
-          "explore-fast-3": "allow",
-          "explore-fast-4": "allow",
-          "implement-fast": "allow",
-          "implement-fast-1": "allow",
-          "implement-fast-2": "allow",
-          "implement-fast-3": "allow",
-          "implement-fast-4": "allow",
+          "explore-fast*": "allow",
+          "implement-fast*": "allow",
           "explore-deep": "allow",
           "implement-deep": "allow"
         }
@@ -325,8 +309,6 @@
           "wc": "allow",
           "which *": "allow",
           "date": "allow",
-          "node -e *": "allow",
-          "python3 -c *": "allow",
           "mkdir -p *": "deny"
         },
         "external_directory": {
@@ -495,8 +477,6 @@
           "wc": "allow",
           "which *": "allow",
           "date": "allow",
-          "node -e *": "allow",
-          "python3 -c *": "allow",
           "mkdir -p *": "deny"
         },
         "external_directory": {
@@ -561,8 +541,6 @@
           "wc": "allow",
           "which *": "allow",
           "date": "allow",
-          "node -e *": "allow",
-          "python3 -c *": "allow",
           "mkdir -p *": "deny"
         },
         "external_directory": {
@@ -627,8 +605,6 @@
           "wc": "allow",
           "which *": "allow",
           "date": "allow",
-          "node -e *": "allow",
-          "python3 -c *": "allow",
           "mkdir -p *": "deny"
         },
         "external_directory": {
@@ -693,8 +669,6 @@
           "wc": "allow",
           "which *": "allow",
           "date": "allow",
-          "node -e *": "allow",
-          "python3 -c *": "allow",
           "mkdir -p *": "deny"
         },
         "external_directory": {

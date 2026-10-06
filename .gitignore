@@ -7,5 +7,7 @@ bun.lock
 auth.json
 .env
 .env.*
+# ...except the template, which carries no host details and documents the vars.
+!.env.example
 *.pem
 *.key

@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# oc-sync — distribute the `oc` helper (and optionally the whole opencode config)
+# to the remote hosts listed in .env.
+#
+# Usage:
+#   bin/oc-sync                 sync `oc` to every host
+#   bin/oc-sync --with-config   also rsync opencode.jsonc, pool-models.json, lib/, plugins/ and .opencode/
+#   bin/oc-sync --dry-run ...   show what would change, write nothing
+#   bin/oc-sync --host NAME ... limit to one host
+#
+# Host details are NOT in this file: this repo is public. They live in .env
+# (gitignored), e.g. OC_HOSTS="host-a host-b"; see .env.example for every
+# variable. If OC_HOSTS is unset the script falls back to ~/.oc-hosts.
+#
+# Why it is shaped this way:
+#   * Command latency on these boxes varies wildly (measured 1.4s to 23s per
+#     remote command). The original made ~12 ssh calls per host, so a slow host
+#     took minutes and looked like a hang. All remote preparation now happens in
+#     ONE ssh call that runs a small script and prints a log.
+#   * Reaching a host by raw IP cost ~11.4s per call versus ~1.4s via its
+#     ssh-config alias, so OC_HOSTS lists aliases, not addresses.
+#   * A failing host must not abort the run, so nothing relies on `set -e`.
+#   * Every ssh is wrapped in `timeout`; rc edits are idempotent.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# .env is gitignored and parsed as shell assignments, so OC_HOSTS and friends can
+# be set there instead of exported by the caller. Sourced before the defaults
+# below, so .env wins when both are present; with no .env, exported variables
+# work on their own.
+ENV_FILE="${OC_SYNC_ENV_FILE:-$REPO_DIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+HOSTS_FILE="${OC_HOSTS_FILE:-$HOME/.oc-hosts}"
+OC_SCRIPT="${OC_SCRIPT:-$SCRIPT_DIR/oc}"
+CONFIG_DIR="${OC_SYNC_CONFIG_DIR:-$REPO_DIR}"
+LOCAL_USER="${OC_LOCAL_USER:-$(whoami)}"
+SSH_TIMEOUT="${OC_SYNC_SSH_TIMEOUT:-90}"
+RSYNC_TIMEOUT="${OC_SYNC_RSYNC_TIMEOUT:-120}"
+SSH_BASE=(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15)
+# remote_prepare feeds a script on stdin, so it must NOT use -n.
+SSH_STDIN=(ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15)
+
+WITH_CONFIG=0
+DRY_RUN=0
+ONLY_HOST=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-config) WITH_CONFIG=1 ;;
+    --dry-run|-n)  DRY_RUN=1 ;;
+    --host)        ONLY_HOST="${2:-}"; shift ;;
+    -h|--help)     sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)             echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ok()   { printf '  \xe2\x9c\x93 %s\n' "$*"; }
+bad()  { printf '  \xe2\x9c\x97 %s\n' "$*"; }
+warn() { printf '  \xe2\x9a\xa0 %s\n' "$*"; }
+
+# rsync with the same ssh options, and --dry-run folded in. rsync's progress
+# lines are noise here; a failing transfer still surfaces through the caller's
+# own exit check.
+rsync_to() {
+  local src="$1" dest="$2"
+  local args=(-az --no-owner --no-group)
+  [[ $DRY_RUN -eq 1 ]] && args+=(-n)
+  timeout "$RSYNC_TIMEOUT" rsync "${args[@]}" \
+    -e "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15" \
+    "$src" "$dest" 2>&1 | grep -vE 'using port|^$|^sending |^sent |^total size' || true
+}
+
+# Host list: OC_HOSTS (whitespace or newline separated) wins, else the legacy
+# ~/.oc-hosts file. Blank lines and # comments are ignored either way.
+HOSTS=()
+if [[ -n "${OC_HOSTS:-}" ]]; then
+  # One host per line, or any mix of spaces, tabs, commas and newlines.
+  mapfile -t HOSTS < <(printf '%s\n' "$OC_HOSTS" | tr ',[:space:]' '\n' | grep -v '^[[:space:]]*$')
+elif [[ -f "$HOSTS_FILE" ]]; then
+  mapfile -t HOSTS < <(sed -e 's/#.*$//' -e 's/[[:space:]]*$//' "$HOSTS_FILE" | grep -v '^$')
+fi
+
+if [[ ${#HOSTS[@]} -eq 0 ]]; then
+  echo "Error: no hosts configured."
+  echo "  Set OC_HOSTS in $ENV_FILE (see .env.example), or point OC_HOSTS_FILE at a list."
+  exit 1
+fi
+
+# Local ssh key, used by the remote `oc` script for tunnel auth.
+LOCAL_KEY_FILE=""
+for F in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecdsa.pub"; do
+  [[ -f "$F" ]] && LOCAL_KEY_FILE="$F" && break
+done
+if [[ -n "$LOCAL_KEY_FILE" ]]; then
+  LOCAL_KEY="$(cat "$LOCAL_KEY_FILE")"
+  if ! grep -qxF "$LOCAL_KEY" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+    mkdir -p "$HOME/.ssh"
+    printf '%s\n' "$LOCAL_KEY" >> "$HOME/.ssh/authorized_keys"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+    ok "added your local public key to ~/.ssh/authorized_keys (for tunnel auth)"
+  else
+    ok "local key already in ~/.ssh/authorized_keys"
+  fi
+else
+  warn "no SSH public key found locally - generate one with ssh-keygen"
+fi
+
+[[ -f "$OC_SCRIPT" ]] || { echo "Error: $OC_SCRIPT not found (set OC_SCRIPT to the oc helper)." >&2; exit 1; }
+if [[ $WITH_CONFIG -eq 1 && ! -f "$CONFIG_DIR/opencode.jsonc" ]]; then
+  echo "Error: $CONFIG_DIR/opencode.jsonc not found; cannot sync config." >&2
+  exit 1
+fi
+
+# One ssh call per host: report identity, ensure ~/bin, put ~/bin on PATH,
+# and set OC_LOCAL_USER. Prints "oc-sync|..." lines the caller renders.
+remote_prepare() {
+  local host="$1"
+  timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s -- "$LOCAL_USER" <<'REMOTE'
+set -u
+LOCAL_USER="$1"
+emit() { echo "oc-sync|$1"; }
+mkdir -p ~/bin 2>/dev/null && emit "ok:ensured ~/bin exists" || emit "err:could not create ~/bin"
+case ":${PATH}:" in
+  *":${HOME}/bin:"*) emit "ok:~/bin already in PATH" ;;
+  *)
+    PATH_LINE='export PATH="$HOME/bin:$PATH"'
+    for RC in .bashrc .profile; do
+      [ -f ~/"$RC" ] || continue
+      if grep -qxF "$PATH_LINE" ~/"$RC" 2>/dev/null; then
+        emit "ok:~/bin already in ~${RC}"
+      elif printf '%s\n' "$PATH_LINE" >> ~/"$RC" 2>/dev/null; then
+        emit "ok:~/bin added to ~${RC}"
+      else
+        emit "warn:could not update ~${RC}"
+      fi
+    done ;;
+esac
+OC_LINE="export OC_LOCAL_USER=${LOCAL_USER}"
+for RC in .bashrc .profile; do
+  [ -f ~/"$RC" ] || continue
+  if grep -qxF "$OC_LINE" ~/"$RC" 2>/dev/null; then
+    emit "ok:OC_LOCAL_USER already set in ~${RC}"
+  elif printf '%s\n' "$OC_LINE" >> ~/"$RC" 2>/dev/null; then
+    emit "ok:OC_LOCAL_USER=${LOCAL_USER} added to ~${RC}"
+  else
+    emit "warn:could not set OC_LOCAL_USER in ~${RC}"
+  fi
+done
+REMOTE
+}
+
+FAILED=()
+DONE=()
+
+for HOST in "${HOSTS[@]}"; do
+  HOST="${HOST%$'\r'}"
+  stripped="${HOST//[[:space:]]/}"
+  [[ -z "$stripped" || "$HOST" == \#* ]] && continue
+  [[ -n "$ONLY_HOST" && "$HOST" != "$ONLY_HOST" ]] && continue
+
+  echo "━━━ Syncing to $HOST ━━━"
+
+  PREP="$(remote_prepare "$HOST")"
+  if [[ -z "$PREP" ]]; then
+    bad "unreachable or too slow (>${SSH_TIMEOUT}s) - skipping, run continues"
+    FAILED+=("$HOST")
+    continue
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    msg="${line#oc-sync|}"
+    case "$msg" in
+      ok:*)   ok "${msg#ok:}" ;;
+      warn:*) warn "${msg#warn:}" ;;
+      err:*)  bad "${msg#err:}"; FAILED+=("$HOST") ;;
+    esac
+  done <<< "$PREP"
+
+  if [[ " ${FAILED[*]-} " == *" $HOST "* ]]; then
+    continue
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    ok "[dry-run] would rsync oc -> ~/bin/oc"
+  elif rsync -az --no-owner --no-group \
+        -e "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15" \
+        "$OC_SCRIPT" "${HOST}:~/bin/" >/dev/null 2>&1; then
+    ok "oc script synced"
+  else
+    bad "rsync of oc failed"
+    FAILED+=("$HOST")
+    continue
+  fi
+
+  if [[ $WITH_CONFIG -eq 1 ]]; then
+    echo "  --- opencode config ---"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      ok "[dry-run] would rsync opencode.jsonc, pool-models.json, lib/, plugins/, .opencode/ (remote backed up first)"
+    else
+      if timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" \
+           "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc pool-models.json .opencode plugins lib 2>/dev/null" >/dev/null 2>&1; then
+        ok "remote config backed up to ~/opencode-config-backup-*.tar.gz"
+      else
+        warn "remote backup failed - skipping config sync for this host"
+        FAILED+=("$HOST")
+        continue
+      fi
+      # lib/ must land before plugins/: the plugins import ../lib/pool.ts, so a
+      # plugins-first sync would leave them unable to resolve on next restart.
+      if [[ -d "$CONFIG_DIR/lib" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/lib' >/dev/null 2>&1
+        rsync_to "$CONFIG_DIR/lib/" "${HOST}:~/.config/opencode/lib/"
+        ok "lib/ synced"
+      fi
+      rsync_to "$CONFIG_DIR/opencode.jsonc"  "${HOST}:~/.config/opencode/"
+      ok "opencode.jsonc synced"
+      # pool-models.json decides which models the pool runs: lib/ and plugins/ read it,
+      # so a host missing it silently falls back to the built-in defaults.
+      if [[ -f "$CONFIG_DIR/pool-models.json" ]]; then
+        rsync_to "$CONFIG_DIR/pool-models.json" "${HOST}:~/.config/opencode/"
+        ok "pool-models.json synced"
+      fi
+      if [[ -d "$CONFIG_DIR/plugins" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1
+        rsync_to "$CONFIG_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/"
+        ok "plugins/ synced"
+      fi
+      if [[ -d "$CONFIG_DIR/.opencode" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/.opencode' >/dev/null 2>&1
+        rsync_to "$CONFIG_DIR/.opencode/" "${HOST}:~/.config/opencode/.opencode/"
+        ok ".opencode/ synced"
+      fi
+      # node_modules / package-lock.json / tests/ are intentionally not synced:
+      # each host keeps its own install and SDK version.
+    fi
+  fi
+
+  ok "done"
+  DONE+=("$HOST")
+done
+
+echo
+echo "━━━ Summary ━━━"
+echo "  synced : ${DONE[*]:-none}"
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+  echo "  failed : ${FAILED[*]}"
+else
+  echo "  failed : none"
+fi
+[[ $DRY_RUN -eq 1 ]] && echo "  dry run: nothing was written"
+if [[ $WITH_CONFIG -eq 0 ]]; then
+  echo
+  echo "  note: this only synced the \`oc\` script."
+  echo "        re-run with --with-config to also push opencode.jsonc, pool-models.json, lib/, plugins/ and .opencode/"
+fi
+[[ ${#FAILED[@]} -gt 0 ]] && exit 1
+exit 0

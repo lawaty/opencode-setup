@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Tunnel port for reverse SSH notifications.
+# Set up RemoteForward 10022:localhost:22 in ~/.ssh/config on your local
+# machine for each remote host. This creates a reverse tunnel so the remote
+# can reach your local SSH daemon via localhost:10022 without needing a
+# publicly reachable IP.
+REVERSE_TUNNEL_PORT="${OC_TUNNEL_PORT:-10022}"
+
+# Local username for reverse tunnel. Set this if your local desktop username
+# differs from the remote user (common case). Example: OC_LOCAL_USER=lawaty
+OC_LOCAL_USER="${OC_LOCAL_USER:-}"
+
+# Determine if we are on a remote machine
+IS_REMOTE=false
+LOCAL_IP=""
+if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
+  IS_REMOTE=true
+  LOCAL_IP="$(echo "$SSH_CLIENT" | awk '{print $1}')"
+fi
+
+send_notify() {
+  local TITLE="$1"
+  local MSG="$2"
+  local URGENCY="${3:-normal}"
+  local ICON="${4:-utilities-terminal}"
+
+  # Build the notify-send command to run on the local machine
+  local NOTIFY_CMD
+  NOTIFY_CMD=$(printf \
+    "DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus notify-send '%s' '%s' --urgency=%s --icon=%s" \
+    "$TITLE" "$MSG" "$URGENCY" "$ICON")
+
+  if [[ "$IS_REMOTE" == "true" ]]; then
+    # Priority 1 — reverse tunnel via RemoteForward (works behind NAT)
+    if [[ -n "$OC_LOCAL_USER" ]]; then
+      ssh -p "$REVERSE_TUNNEL_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes \
+          -o ConnectTimeout=3 "${OC_LOCAL_USER}@localhost" \
+          "$NOTIFY_CMD" 2>/dev/null && return 0 || true
+    fi
+
+    # Try without explicit user (works if remote user matches local)
+    ssh -p "$REVERSE_TUNNEL_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes \
+         -o ConnectTimeout=3 localhost \
+         "$NOTIFY_CMD" 2>/dev/null && return 0 || true
+
+    # Priority 2 — direct SSH back via SSH_CLIENT IP (works on LAN / VPN)
+    if [[ -n "$LOCAL_IP" ]]; then
+      if [[ -n "$OC_LOCAL_USER" ]]; then
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 \
+            "${OC_LOCAL_USER}@${LOCAL_IP}" \
+            "$NOTIFY_CMD" 2>/dev/null && return 0 || true
+      fi
+
+      ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 \
+           "$LOCAL_IP" \
+           "$NOTIFY_CMD" 2>/dev/null && return 0 || true
+    fi
+
+    echo "oc: warning: could not send notification" >&2
+    echo "  Set OC_LOCAL_USER=lawaty (or your local username)" >&2
+    echo "  and ensure your key is in local authorized_keys." >&2
+    return 1
+  else
+    notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON"
+  fi
+}
+
+# If invoked as oc-notify (symlink or direct call), run notify and exit
+if [[ "$(basename "$0")" == "oc-notify" ]]; then
+  send_notify "$@" || true
+  exit $?
+fi
+
+send_notify "OpenCode" "Starting OpenCode session..." || true
+
+opencode "$@"
+
+EXIT_CODE=$?
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  send_notify "OpenCode" "Session completed successfully" || true
+else
+  send_notify "OpenCode" "Session exited with code $EXIT_CODE" "critical" || true
+fi
+
+exit $EXIT_CODE

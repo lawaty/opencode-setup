@@ -16,10 +16,6 @@ and how the pieces are distributed.
 | `plugins/context-autoupdate.ts` | keeps `.opencode/context/` current; borrows a pool slot |
 | `.opencode/prompts/` | 6 prompts shared by 19 agents |
 | `tests/` | 7 offline suites, no network, no running server |
-| `~/bin/oc-sync` | distributes this setup to the two remote hosts (outside the repo, host-specific) |
-| `~/.local/share/opencode/agent-pool/` | live cross-process claims + cooldowns |
-| `~/.local/share/opencode/auth.json` | credentials — deliberately **outside** this repo |
-| `.opencode/context/` | this project's context map — derived, not in git (see below) |
 
 ## Health checks
 
@@ -78,6 +74,31 @@ resolves to the wrong model. If the plugin is disabled (`opencode --pure`) the v
 have no model at all and inherit the session's — check the plugin is loading before
 debugging a wrong model.
 
+## Why opencode.jsonc is ~730 lines
+
+Audited, and most of it is structural rather than redundant:
+
+- **12 of the 19 agents are pool variants** (`explore-fast-1..4`, `implement-fast-1..4`,
+  `context-manager-1..4`). Each must be a distinct agent because each must resolve a
+  distinct model, and opencode has no agent inheritance, so each repeats its base's
+  prompt and permission block. Generating them from the plugin does not work: an agent
+  created in the `config` hook is not registered by opencode (`opencode debug agent` for
+  a hook-created name returns "not found"), which is why they are declared here.
+- **Task rules use globs** (`explore-fast*`), because opencode compiles a permission
+  pattern to an anchored regex with `*` → `.*` and the longest match wins. Listing all
+  four variants per base meant adding a line to two agents for every new slot.
+- **The models are not here at all** — `pool-models.json` owns them and the plugin
+  injects them.
+- `mcp.playwright` plus the `playwright_*` grants on the explore and implement agents are
+  deliberate: those agents may drive a browser even though no prompt mentions it. The
+  per-agent grant uses the deprecated `tools` field on purpose — the schema points at
+  `permission`, but the tool must survive the global `tools.playwright_*: false`.
+| `bin/oc`, `bin/oc-sync` | the `oc` launcher and the deploy script, both in the repo; `~/bin/oc` and `~/bin/oc-sync` are symlinks to them |
+| `.env` / `.env.example` | host list and deploy overrides — `.env` is gitignored, `.env.example` documents every variable |
+| `~/.local/share/opencode/agent-pool/` | live cross-process claims + cooldowns |
+| `~/.local/share/opencode/auth.json` | credentials — deliberately **outside** this repo |
+| `.opencode/context/` | this project's context map — derived, not in git (see below) |
+
 ## Restarts
 
 **Plugins are not hot-reloaded.** Any change to `pool-models.json`, `opencode.jsonc`,
@@ -92,12 +113,21 @@ against the file mtime before concluding a change is live.
 ## Deploying to the other hosts
 
 ```bash
-./bin/oc-sync --with-config           # both remote hosts
-./bin/oc-sync --with-config --dry-run # preview
-./bin/oc-sync --host <alias>          # one host (see aliases in ~/.oc-hosts)
+bin/oc-sync --with-config           # every host in $OC_HOSTS
+bin/oc-sync --with-config --dry-run # preview
+bin/oc-sync --host <alias>          # one host
 ```
 
-Pushes `opencode.jsonc`, `lib/`, `plugins/`, `.opencode/` — with a remote backup first.
+Pushes `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/` — with a
+remote backup first.
+
+**Host details live in `.env`, not in the repo.** The repo is public, so `bin/oc-sync`
+carries no names, addresses or usernames: it reads `OC_HOSTS` (whitespace, comma or
+newline separated) and optional overrides from `.env`, which `.gitignore` keeps out of
+git. `.env.example` is the template. With no `.env`, the script falls back to the legacy
+`~/.oc-hosts`. `.env` is sourced before the script's defaults, so it wins over exported
+variables. `~/bin/oc` and `~/bin/oc-sync` are symlinks into the repo, so both spellings
+work.
 Two ordering and scope rules that are easy to get wrong:
 
 - **`lib/` must land before `plugins/`.** Both plugins import from `../lib/`; a
@@ -161,7 +191,9 @@ Not covered by git:
 
 - **The context map** (`~/.opencode/context/`) — intentionally outside git and not synced.
   Derived, per-project, and rebuilt on demand; see [The context map](#the-context-map).
-- `~/bin/oc-sync` and `~/.oc-hosts` — host-specific, outside the repo deliberately.
+- `~/bin/oc-hosts` and `.env` — host-specific, deliberately outside version control.
+  `bin/oc-sync` reads the host list from `.env`; `~/.oc-hosts` remains only as a
+  fallback for when `.env` is absent.
 - The remote hosts — rsync copies, no history.
 
 Before publishing anything here, note that the repo is **public**: treat every tracked

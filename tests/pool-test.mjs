@@ -165,15 +165,43 @@ for (const [name, def] of Object.entries(cfg.agent)) {
   const [provider, id] = def.model.split("/")
   assert(cfg.provider[provider]?.whitelist.includes(id), `agent ${name} runs unwhitelisted ${def.model}`)
 }
-// any agent allowed to spawn a base must be allowed to spawn all its variants
+// opencode compiles a permission pattern to an anchored regex (* -> .*) and lets
+// the longest match win, so "explore-fast*" covers the base and every variant.
+// What must hold is not that each name is listed, but that a base and its variants
+// resolve the same way -- otherwise the pool routes a spawn to a variant the
+// caller is not allowed to run.
+const compilePermission = (pattern) =>
+  new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "s")
+const taskAllows = (task, target) => {
+  let best
+  for (const [pattern, action] of Object.entries(task)) {
+    if (!compilePermission(pattern).test(target)) continue
+    if (!best || pattern.length > best.pattern.length) best = { pattern, action }
+  }
+  return best?.action === "allow"
+}
 for (const [name, def] of Object.entries(cfg.agent)) {
   const task = def.permission?.task
   if (!task) continue
   for (const base of BASES) {
-    if (task[base] !== "allow") continue
     for (let i = 1; i <= SLOT_MODELS.length; i++) {
-      assert(task[`${base}-${i}`] === "allow", `${name} allows ${base} so it must allow ${base}-${i}`)
+      assert(
+        taskAllows(task, `${base}-${i}`) === taskAllows(task, base),
+        `${name}: task rule for ${base} must cover ${base}-${i} the same way`,
+      )
     }
+  }
+}
+
+// 10b. the one-writer agent must have no path to code execution: edit/write are
+//      denied and `mkdir -p *` is denied, so an allowed `node -e *` would undo
+//      every one of those rules in a single call.
+const INTERPRETERS = new Set(["node", "python", "python3", "sh", "bash", "zsh", "perl", "ruby", "php", "env"])
+for (const [name, def] of Object.entries(rawCfg.agent)) {
+  if (!name.startsWith("context-manager")) continue
+  for (const [pattern, action] of Object.entries(def.permission?.bash ?? {})) {
+    if (action !== "allow" || pattern === "*") continue
+    assert(!INTERPRETERS.has(pattern.split(/\s+/)[0]), `${name} may run \`${pattern}\`, which is arbitrary code execution`)
   }
 }
 
