@@ -15,9 +15,9 @@
     "Changing this file requires restarting every opencode process: plugins are not hot-reloaded."
   ],
   "slots": [
-    { "model": "opencode/big-pickle", "tier": "primary" },
-    { "model": "opencode-go/space-bunny-free", "tier": "primary" },
-    { "model": "opencode/nemotron-3-ultra-free", "tier": "overflow" },
-    { "model": "opencode-go/longcat-2.5-preview-free", "tier": "overflow" }
+    { "model": "opencode/space-bunny-free", "tier": "primary" },
+    { "model": "opencode-go/longcat-2.5-preview-free", "tier": "primary" },
+    { "model": "opencode/big-pickle", "tier": "overflow" },
+    { "model": "opencode/nemotron-3-ultra-free", "tier": "overflow" }
   ]
 }
