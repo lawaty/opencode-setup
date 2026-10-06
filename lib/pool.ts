@@ -1,6 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 // Shared model pool for every free-model agent type.
 //
@@ -16,6 +17,9 @@ import { join } from "node:path"
 // plugins/context-autoupdate.ts borrows a slot directly, because it spawns its
 // agent through the session API rather than the task tool and so never passes
 // through the task hook.
+//
+// Which models fill the slots comes from pool-models.json (see readSlotFile),
+// resolved once per process into State.slots and shared by both plugins.
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
@@ -44,14 +48,57 @@ export type Snapshot = {
 
 export const BASES = ["explore-fast", "implement-fast", "context-manager"]
 
-export const SLOTS: Slot[] = [
+// The pool is configured by ONE hand-edited file, pool-models.json, next to
+// opencode.jsonc. The variant agents in opencode.jsonc (explore-fast-1 ...)
+// are rewritten from it at config time by plugins/agent-pool.ts, so swapping a
+// model means editing this file, never a dozen agent definitions. The values
+// below are the fallback used only when the file is missing or unusable, so a
+// typo degrades to a logged warning instead of a pool that cannot route.
+export const MODELS_FILE = "pool-models.json"
+export const CONFIG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..")
+export const MODELS_PATH = join(CONFIG_DIR, MODELS_FILE)
+
+export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/big-pickle", tier: "primary" },
   { index: 2, model: "opencode-go/space-bunny-free", tier: "primary" },
   { index: 3, model: "opencode/nemotron-3-ultra-free", tier: "overflow" },
   { index: 4, model: "opencode-go/longcat-2.5-preview-free", tier: "overflow" },
 ]
 
-const SLOT_BY_MODEL = new Map(SLOTS.map((s) => [s.model, s]))
+export type SlotFile = { slots: Slot[]; problems: string[] }
+
+// Slot indices are the array position, so the file is the only place a slot
+// number exists; nothing downstream can disagree with it. Every entry is
+// validated on its own: one bad slot is dropped with a warning, the rest still
+// route, unless nothing survives and the built-in defaults take over.
+export function readSlotFile(path: string = MODELS_PATH): SlotFile {
+  const problems: string[] = []
+  let parsed: { slots?: unknown }
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as { slots?: unknown }
+  } catch (error) {
+    return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${String(error)}); using built-in defaults`] }
+  }
+  if (!Array.isArray(parsed.slots) || parsed.slots.length === 0) {
+    return { slots: FALLBACK_SLOTS, problems: [`${path} has no non-empty "slots" array; using built-in defaults`] }
+  }
+  const slots: Slot[] = []
+  parsed.slots.forEach((entry, i) => {
+    const model = typeof (entry as { model?: unknown })?.model === "string" ? ((entry as { model: string }).model).trim() : ""
+    const raw = (entry as { tier?: unknown })?.tier
+    const tier = raw === "primary" || raw === "overflow" ? raw : undefined
+    const at = `slot ${i + 1}`
+    if (!model.includes("/")) return problems.push(`${at}: model must be written provider/model-id, got "${model}"`)
+    if (!tier) return problems.push(`${at} (${model}): tier must be "primary" or "overflow", got ${JSON.stringify(raw)}`)
+    if (slots.some((s) => s.model === model)) return problems.push(`${at}: ${model} is already used by another slot; slots must be distinct models`)
+    slots.push({ index: slots.length + 1, model, tier })
+  })
+  if (slots.length === 0) {
+    problems.push(`${path} yielded no usable slot; using built-in defaults`)
+    return { slots: FALLBACK_SLOTS, problems }
+  }
+  return { slots, problems }
+}
 
 const LIMIT_PATTERNS = [
   /rate[\s_-]?limit/i,
@@ -105,14 +152,17 @@ type State = {
   lastSweep: number
   id: string
   dir: string
+  modelsFile: string
+  slots: Slot[]
 }
 
-export function state(opts: { id?: string; dir?: string } = {}): State {
+export function state(opts: { id?: string; dir?: string; modelsFile?: string } = {}): State {
   const id = opts.id ?? String(process.pid)
   const dir = opts.dir ?? join(homedir(), ".local", "share", "opencode", "agent-pool")
+  const modelsFile = opts.modelsFile ?? MODELS_PATH
   // Keyed by identity so the pool plugin and context-autoupdate share one state
   // in a process (same pid + dir), while separate ids stay independent.
-  const key = Symbol.for(`agent-pool:state:${id}:${dir}`)
+  const key = Symbol.for(`agent-pool:state:${id}:${dir}:${modelsFile}`)
   const g = globalThis as Record<symbol, State | undefined>
   if (!g[key]) {
     g[key] = {
@@ -131,9 +181,21 @@ export function state(opts: { id?: string; dir?: string } = {}): State {
       lastSweep: 0,
       id,
       dir,
+      modelsFile,
+      slots: [],
     }
   }
   return g[key]
+}
+
+// Read once per process, on first use: plugins are not hot-reloaded, so editing
+// pool-models.json means restarting opencode anyway.
+export function ensureSlots(s: State, onWarn: (m: string) => void) {
+  if (s.slots.length > 0) return s.slots
+  const { slots, problems } = readSlotFile(s.modelsFile)
+  s.slots = slots
+  for (const problem of problems) onWarn(problem)
+  return slots
 }
 
 export const claimKey = (sessionID: string, callID: string) => `${sessionID}:${callID}`
@@ -141,6 +203,7 @@ export const selfFile = (id: string) => `claims.${id}.json`
 const limitFile = (model: string) => `limit.${model.replace(/[^a-zA-Z0-9._-]/g, "__")}.json`
 
 export function init(s: State, onWarn: (m: string) => void) {
+  ensureSlots(s, onWarn)
   if (s.initialized) return
   s.initialized = true
   try {
@@ -297,8 +360,9 @@ function leastLoaded(slots: Slot[], counts: Map<string, number>) {
 // least-loaded overflow slot; from the third acquire onward the sequence is
 // exactly the 1,2,3,4 cycle.
 export function pickSlot(s: State, snap: Snapshot): Slot {
-  const usable = SLOTS.filter((slot) => isAvailable(s, slot.model, snap.cooling))
-  const pool = usable.length > 0 ? usable : SLOTS
+  const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
+  const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
+  const pool = usable.length > 0 ? usable : slots
   const primaries = pool.filter((slot) => slot.tier === "primary")
   const overflow = pool.filter((slot) => slot.tier === "overflow")
   if (primaries.length === 0) return leastLoaded(overflow.length ? overflow : pool, snap.counts)
@@ -365,8 +429,8 @@ export function releaseStuck(s: State, keys: string[]) {
   if (keys.length > 0) publish(s)
 }
 
-export function slotFor(model: string) {
-  return SLOT_BY_MODEL.get(model)
+export function slotFor(s: State, model: string) {
+  return s.slots.find((slot) => slot.model === model)
 }
 
 export const providerOf = (model: string) => model.split("/")[0] ?? model
@@ -377,7 +441,7 @@ export const providerOf = (model: string) => model.split("/")[0] ?? model
 // provider is cooled until the stated reset rather than one model at a time.
 export function coolProvider(s: State, provider: string, until: number, reason: string) {
   const affected: Strike[] = []
-  for (const slot of SLOTS) {
+  for (const slot of s.slots.length > 0 ? s.slots : FALLBACK_SLOTS) {
     if (providerOf(slot.model) !== provider) continue
     const existing = s.cooling.get(slot.model)
     const untilMs = Math.max(until, existing?.until ?? 0)

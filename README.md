@@ -84,8 +84,10 @@ routing reads every sibling file. Cooldowns are one file per model for the same 
 ## Layout
 
 ```
-opencode.jsonc            agents, permissions, provider whitelists
+opencode.jsonc            agents, permissions, provider whitelists (no pool models)
+pool-models.json          the pool's models and tiers -- the file you edit
 lib/pool.ts               shared pool state + slot decision (imported by both plugins)
+lib/writer-rule.ts        startup check that the one-writer permission rule fires
 plugins/agent-pool.ts     hooks: task routing, limit detection, hang reaper, pool_status
 plugins/context-autoupdate.ts
                           keeps .opencode/context/ current; borrows a pool slot
@@ -93,8 +95,13 @@ plugins/context-autoupdate.ts
 tests/                    6 test suites, no network needed
 ```
 
-`lib/pool.ts` lives outside `plugins/` on purpose: opencode loads everything in
-`plugins/` as a plugin, and this module exports no plugin.
+`lib/` lives outside `plugins/` on purpose: opencode loads **every export** of every file
+in `plugins/` as a plugin and uses the return value as a hooks object, so a stray export
+there is not a helper, it is a broken plugin. A non-plugin helper exported from
+`context-autoupdate.ts` once returned `undefined`, poisoned the shared hook registry, and
+took down every hook dispatch — opencode would not start. Both modules here export no
+plugin, which is also why `verifyWriterRule` was moved out of the plugin file rather than
+left beside it.
 
 ## Tests
 
@@ -107,6 +114,7 @@ node tests/pool-limits-test.mjs # cooldowns, backoff, stated resets, degraded mo
 node tests/pool-hang-test.mjs   # hang detection, abort, never killing live work
 node tests/pool-shared-test.mjs # slots shared across base agent types
 node tests/pool-timer-test.mjs  # reaper on a timer with no new spawns
+node tests/pool-models-test.mjs # pool-models.json drives agents, whitelists, fallbacks
 node tests/permission-test.mjs  # the one-writer rule actually matches the map path
 ```
 
@@ -115,15 +123,26 @@ regressions for two bugs that reached production: the reaper originally ran only
 next task spawn (a hung task survived 18 minutes), and limit detection only matched an
 error shape opencode never actually emits.
 
-`permission-test.mjs` covers a third: the context map could not be written at all,
-because the one-writer rule was `.opencode/context/**` while opencode matches the
-**resolved absolute** path. `prompt()` resolves either way, so a fully blocked run
-logged `finished files=4` while changing nothing, and the map sat stale for days.
-`context-autoupdate.ts` now checks the rule at startup and reports how many map files
-actually changed on disk, rather than how many it offered the cartographer.
+`permission-test.mjs` covers a third: the context map could not be written at all.
+`prompt()` resolves either way, so a fully blocked run logged `finished files=4`
+while changing nothing, and the map sat stale for days. The cause was the one-writer
+permission rule: opencode evaluates file permissions against the path **relative to the
+project root**, and the rule was written for the absolute path — so after `6f6af0a`
+"corrected" it that way, the map was still unwritable, undetected, because the
+startup check was matching the absolute path too. Both spellings are now allowed and
+the check follows the form that applies to the running project. `context-autoupdate.ts`
+reports how many map files actually changed on disk, rather than how many it offered
+the cartographer.
 
 `tests/models-snapshot.json` pins the free-cost proof; refresh it with
 `curl -sS https://models.dev/api.json`.
+
+`pool-models-test.mjs` covers the fourth regression class: the pool's models used to be
+duplicated in `lib/pool.ts` *and* in twelve agent definitions, so changing one meant
+three edits that could silently disagree — a variant agent could keep a model the router
+no longer used, and an unwhitelisted model resolves to no model at all. One file now
+owns the list, the config hook derives everything else from it, and the tests fail if a
+`model` creeps back into a variant.
 
 ## Operational notes
 
@@ -133,9 +152,10 @@ actually changed on disk, rather than how many it offered the cartographer.
   opencode process. There is no systemd unit or tmux session — they are foreground
   processes, so restart each in its own terminal.
 - `auth.json` lives in `~/.local/share/opencode/`, **not** in this repo.
-- `@opencode-ai/plugin` is pinned. The pool was verified against **1.16.2**; a host
-  running a newer SDK may work but is untested — check `package.json` on each machine
-  before assuming parity.
+- `@opencode-ai/plugin` is pinned to the opencode binary's own version (**1.18.34**) so the
+  SDK and the runtime agree; a mismatch is silent, since only `tool()` is called at runtime
+  and nothing type-checks in production. Check `package.json` on each machine before
+  assuming parity.
 - My `oc-sync` script distributes this setup to remote hosts (`--with-config` also
   pushes `lib/`, which the plugins import). It lives outside this repo since it is
   host-specific.

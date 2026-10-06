@@ -96,8 +96,7 @@
       }
     },
     "explore-fast-1": {
-      "model": "opencode/big-pickle",
-      "description": "explore-fast primary pool variant on big-pickle (Zen, free). Load-equalized with explore-fast-2 by the agent-pool plugin — spawn 'explore-fast' instead.",
+      "description": "hidden pool variant explore-fast-1: slot 1. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'explore-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -123,8 +122,7 @@
       }
     },
     "explore-fast-2": {
-      "model": "opencode-go/space-bunny-free",
-      "description": "explore-fast primary pool variant on space-bunny-free (free, 1M context, on opencode-go so a Zen-wide limit cannot disable both primaries). Load-equalized with explore-fast-1 by the agent-pool plugin — spawn 'explore-fast' instead.",
+      "description": "hidden pool variant explore-fast-2: slot 2. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'explore-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -150,8 +148,7 @@
       }
     },
     "explore-fast-3": {
-      "model": "opencode/nemotron-3-ultra-free",
-      "description": "explore-fast overflow pool variant on nemotron-3-ultra-free (Zen, free, 1M context). Engaged by the agent-pool plugin only while both primary variants are already running ahead of it — spawn 'explore-fast' instead.",
+      "description": "hidden pool variant explore-fast-3: slot 3. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'explore-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -177,8 +174,7 @@
       }
     },
     "explore-fast-4": {
-      "model": "opencode-go/longcat-2.5-preview-free",
-      "description": "explore-fast overflow pool variant on longcat-2.5-preview-free (free, 1M context). On opencode-go on purpose so a Zen-wide free limit cannot disable three of four slots — spawn 'explore-fast' instead.",
+      "description": "hidden pool variant explore-fast-4: slot 4. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'explore-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -346,8 +342,7 @@
       }
     },
     "implement-fast-1": {
-      "model": "opencode/big-pickle",
-      "description": "implement-fast pool slot 1 on big-pickle (Zen, free). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "description": "hidden pool variant implement-fast-1: slot 1. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'implement-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -373,8 +368,7 @@
       }
     },
     "implement-fast-2": {
-      "model": "opencode-go/space-bunny-free",
-      "description": "implement-fast pool slot 2 on space-bunny-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "description": "hidden pool variant implement-fast-2: slot 2. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'implement-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -400,8 +394,7 @@
       }
     },
     "implement-fast-3": {
-      "model": "opencode/nemotron-3-ultra-free",
-      "description": "implement-fast pool slot 3 on nemotron-3-ultra-free (Zen, free, 1M context). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "description": "hidden pool variant implement-fast-3: slot 3. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'implement-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -427,8 +420,7 @@
       }
     },
     "implement-fast-4": {
-      "model": "opencode-go/longcat-2.5-preview-free",
-      "description": "implement-fast pool slot 4 on longcat-2.5-preview-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn implement-fast instead.",
+      "description": "hidden pool variant implement-fast-4: slot 4. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'implement-fast' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.2,
@@ -454,8 +446,7 @@
       }
     },
     "context-manager-1": {
-      "model": "opencode/big-pickle",
-      "description": "context-manager pool slot 1 on big-pickle (Zen, free). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "description": "hidden pool variant context-manager-1: slot 1. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'context-manager' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.1,
@@ -521,8 +512,7 @@
       }
     },
     "context-manager-2": {
-      "model": "opencode-go/space-bunny-free",
-      "description": "context-manager pool slot 2 on space-bunny-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "description": "hidden pool variant context-manager-2: slot 2. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'context-manager' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.1,
@@ -588,8 +578,7 @@
       }
     },
     "context-manager-3": {
-      "model": "opencode/nemotron-3-ultra-free",
-      "description": "context-manager pool slot 3 on nemotron-3-ultra-free (Zen, free, 1M context). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "description": "hidden pool variant context-manager-3: slot 3. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'context-manager' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.1,
@@ -655,8 +644,7 @@
       }
     },
     "context-manager-4": {
-      "model": "opencode-go/longcat-2.5-preview-free",
-      "description": "context-manager pool slot 4 on longcat-2.5-preview-free (free, 1M context, opencode-go). Acquired by the agent-pool plugin - spawn context-manager instead.",
+      "description": "hidden pool variant context-manager-4: slot 4. Its model is NOT set here -- plugins/agent-pool.ts injects it from pool-models.json at config time, so that file is the only place the pool models live. Spawn 'context-manager' and let the pool route.",
       "mode": "subagent",
       "hidden": true,
       "temperature": 0.1,

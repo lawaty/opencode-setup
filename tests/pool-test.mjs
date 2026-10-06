@@ -11,6 +11,10 @@ const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
 const SNAPSHOT = join(HERE, "models-snapshot.json")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
+// pool-models.json is the single source of truth for the pool, so the test reads
+// it rather than repeating the models: swapping one is not a test edit.
+const SLOT_MODELS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots.map((s) => s.model)
+
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
 const { AgentPool } = await import(PLUGIN)
@@ -61,8 +65,7 @@ assert(seq(back) === "3,3,4,1", `overflow should drain before primaries retake, 
 
 // 4. pool_status reports global load, models, tiers, per-process breakdown
 const statusOut = await a.status()
-assert(statusOut.includes("opencode/big-pickle") && statusOut.includes("opencode-go/space-bunny-free"), "status should show both primary models")
-assert(statusOut.includes("nemotron-3-ultra-free") && statusOut.includes("longcat-2.5-preview-free"), "status should show both overflow models")
+for (const model of SLOT_MODELS) assert(statusOut.includes(model), `status should list ${model}`)
 assert(/slot 1 primary/.test(statusOut) && /slot 3 overflow/.test(statusOut), "status should label tiers")
 assert(/across 1 process\(es\)/.test(statusOut), "solo process should report one process")
 
@@ -126,14 +129,18 @@ assert((await a.spawn("x3", "explore-fast-2")) === "explore-fast-2", "direct var
 await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x5" }, {})
 await a.finish("nonexistent")
 
-// 10. config invariants: every pooled base has 4 hidden variants, one per slot
+// 10. config invariants: every pooled base has one hidden variant per slot in
+//     pool-models.json, each running that slot's model -- and none of them
+//     hard-codes one, so the file really is the only place a pool model lives
+const rawCfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 const BASES = ["explore-fast", "implement-fast", "context-manager"]
-const SLOT_MODELS = [
-  "opencode/big-pickle",
-  "opencode-go/space-bunny-free",
-  "opencode/nemotron-3-ultra-free",
-  "opencode-go/longcat-2.5-preview-free",
-]
+for (const base of BASES) {
+  SLOT_MODELS.forEach((_, i) => {
+    const v = `${base}-${i + 1}`
+    assert(rawCfg.agent[v] !== undefined, `${v} must be declared in opencode.jsonc`)
+    assert(rawCfg.agent[v].model === undefined, `${v} must not hard-code a model; pool-models.json injects it`)
+  })
+}
 for (const base of BASES) {
   assert(cfg.agent[base], `base agent ${base} must exist`)
   SLOT_MODELS.forEach((model, i) => {

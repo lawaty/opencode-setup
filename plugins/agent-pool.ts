@@ -5,6 +5,12 @@ import * as pool from "../lib/pool.ts"
 // onto a shared set of four free models, and keeps the pool off models that are
 // known to be unusable right now.
 //
+// The four models are not written here. They live in pool-models.json, and the
+// config hook rewrites the variant agents (explore-fast-N, ...) and the provider
+// whitelists in opencode.jsonc from that file, so changing the pool is a one-file
+// edit instead of editing twelve agent definitions. The models in opencode.jsonc
+// are defaults that this plugin overwrites.
+//
 // A spawn of a pooled base type is rewritten to <base>-<slot>, where the slot is
 // chosen by live in-flight load counted per MODEL across every agent type. So
 // explore-fast and implement-fast compete for the same capacity instead of each
@@ -42,7 +48,7 @@ const REAP_INTERVAL_MS = 30_000
 const HANG_FALLBACK_MS = 10 * 60 * 1000
 
 export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions) => {
-  const opts = (options ?? {}) as { id?: string; dir?: string; reapMs?: number }
+  const opts = (options ?? {}) as { id?: string; dir?: string; reapMs?: number; modelsFile?: string }
   const s = pool.state(opts)
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
@@ -110,12 +116,52 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
 
   return {
     config: async (cfg) => {
+      const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
+      const agents = cfg.agent as Record<string, { model?: string; [k: string]: unknown }> | undefined
+      const providers = cfg.provider as Record<string, { whitelist?: string[] }> | undefined
       const known = new Set<string>()
-      for (const [name, def] of Object.entries(cfg.agent ?? {})) {
-        if (def?.model) s.models.set(name, def.model)
-        if (pool.SLOTS.some((slot) => pool.agentFor(name, slot.index) === name)) known.add(name)
+      for (const [name, def] of Object.entries(cfg.agent ?? {})) if (def?.model) s.models.set(name, def.model)
+
+      for (const slot of slots) {
+        // The variant agents carry no model in opencode.jsonc: it is injected
+        // here from pool-models.json, so that file is the only place a pool model
+        // is written down. A model still present in the config is a stale leftover
+        // and is reported, not obeyed.
+        for (const base of pool.BASES) {
+          const name = pool.agentFor(base, slot.index)
+          const def = agents?.[name]
+          if (!def) {
+            await warnOnce(`variant ${name} missing from opencode.jsonc; spawns of ${base} that route to slot ${slot.index} would fail`)
+            continue
+          }
+          if (def.model && def.model !== slot.model) {
+            await warnOnce(`${name} still hard-codes ${def.model} in opencode.jsonc; pool-models.json wins (${slot.model}). Delete the line to keep one source of truth.`)
+          }
+          def.model = slot.model
+          known.add(name)
+          s.models.set(name, slot.model)
+        }
+
+        // opencode deletes every model a provider offers that is not whitelisted,
+        // so a slot whose model is missing from the whitelist silently resolves to
+        // no model at all. Add it instead of making the user edit a second file.
+        const [provider, id] = slot.model.split("/")
+        const entry = providers?.[provider]
+        if (!entry) {
+          await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
+          continue
+        }
+        const list = (entry.whitelist ??= [])
+        if (!list.includes(id)) {
+          list.push(id)
+          await log("info", `whitelisted ${id} on ${provider} (pool-models.json slot ${slot.index})`)
+        }
       }
       s.known = known
+      await log(
+        "info",
+        `pool-models.json: bound ${known.size} variant agent(s) to ${slots.length} slot(s): ${slots.map((sl) => `${sl.index}=${sl.model} ${sl.tier}`).join(", ")}`,
+      )
     },
 
     event: async ({ event }) => {
@@ -215,7 +261,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
         // A directly spawned variant is still counted, never rewritten.
         const direct = /^(.*)-([1-9][0-9]*)$/.exec(requested)
         if (direct && pool.BASES.includes(direct[1])) {
-          const slot = pool.SLOTS.find((sl) => sl.index === Number(direct[2]))
+          const slot = s.slots.find((sl) => sl.index === Number(direct[2]))
           if (slot) pool.acquire(s, direct[1], slot, input.sessionID, pool.claimKey(input.sessionID, input.callID))
         }
       } catch (error) {
@@ -235,6 +281,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
         args: {},
         async execute() {
           pool.refreshCatalog(s, serverUrl)
+          const slots = pool.ensureSlots(s, (m) => void warnOnce(m))
           const snap = pool.snapshot(s)
           const now = Date.now()
           const byModel = new Map<string, { total: number; bases: Map<string, number> }>()
@@ -266,9 +313,9 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${pool.SLOTS.length} free models; bases: ${pool.BASES.join(", ")}`,
-              ...pool.SLOTS.filter((sl) => sl.tier === "primary").map(line),
-              ...pool.SLOTS.filter((sl) => sl.tier === "overflow").map(line),
+              `shared pool over ${slots.length} free models from ${pool.MODELS_FILE}; bases: ${pool.BASES.join(", ")}`,
+              ...slots.filter((sl) => sl.tier === "primary").map(line),
+              ...slots.filter((sl) => sl.tier === "overflow").map(line),
               "",
               "by process:",
               `  ${s.id} (this process): ${snap.own.size} claim(s)`,

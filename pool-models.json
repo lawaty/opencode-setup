@@ -1,0 +1,23 @@
+{
+  "$comment": [
+    "THE ONLY FILE YOU EDIT TO CHANGE THE POOL.",
+    "plugins/agent-pool.ts reads it at config time and rewrites every pooled variant agent",
+    "(explore-fast-N, implement-fast-N, context-manager-N) plus the provider whitelists in",
+    "opencode.jsonc to match, so the model definitions there are only defaults.",
+    "Slot N is the same model for every base agent, which is what makes load shared.",
+    "",
+    "Rules, all validated at startup: models are written provider/model-id, must be distinct,",
+    "and tier must be primary or overflow. primary slots are kept equal and hold a lead of 2",
+    "over the least-loaded overflow slot; primaries are used first, overflow after.",
+    "Keep the models free (0/0 cost) and tool-call capable: check them against models.dev",
+    "(curl -sS https://models.dev/api.json, snapshot in tests/models-snapshot.json).",
+    "",
+    "Changing this file requires restarting every opencode process: plugins are not hot-reloaded."
+  ],
+  "slots": [
+    { "model": "opencode/big-pickle", "tier": "primary" },
+    { "model": "opencode-go/space-bunny-free", "tier": "primary" },
+    { "model": "opencode/nemotron-3-ultra-free", "tier": "overflow" },
+    { "model": "opencode-go/longcat-2.5-preview-free", "tier": "overflow" }
+  ]
+}

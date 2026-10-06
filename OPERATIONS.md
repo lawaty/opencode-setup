@@ -8,16 +8,18 @@ and how the pieces are distributed.
 
 | Path | Role |
 |---|---|
-| `opencode.jsonc` | 19 agents (3 pooled bases + 12 hidden variants + 4 unpooled), permissions, provider whitelists |
+| `pool-models.json` | the pool's models and tiers — the only file to edit to swap a model |
+| `opencode.jsonc` | 19 agents (3 pooled bases + 12 hidden variants + 4 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
 | `lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
+| `lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
 | `plugins/agent-pool.ts` | task routing, limit detection, 30s hang reaper, `pool_status` |
 | `plugins/context-autoupdate.ts` | keeps `.opencode/context/` current; borrows a pool slot |
 | `.opencode/prompts/` | 6 prompts shared by 19 agents |
-| `tests/` | 6 offline suites, no network, no running server |
+| `tests/` | 7 offline suites, no network, no running server |
 | `~/bin/oc-sync` | distributes this setup to the two remote hosts (outside the repo, host-specific) |
 | `~/.local/share/opencode/agent-pool/` | live cross-process claims + cooldowns |
 | `~/.local/share/opencode/auth.json` | credentials — deliberately **outside** this repo |
-| `~/.opencode/context/` | this project's context map — derived, not in git (see below) |
+| `.opencode/context/` | this project's context map — derived, not in git (see below) |
 
 ## Health checks
 
@@ -39,14 +41,52 @@ Log lines worth knowing: `routed <base> -> <variant>` on every pooled spawn,
 `borrowed pool slot N … for auto update` when the cartographer runs,
 `reaper armed` once per process at startup.
 
+## Changing the pool models
+
+Edit `pool-models.json` — one entry per slot, array position is the slot number:
+
+```json
+{ "slots": [
+  { "model": "opencode/big-pickle", "tier": "primary" },
+  { "model": "opencode-go/space-bunny-free", "tier": "primary" },
+  { "model": "opencode/nemotron-3-ultra-free", "tier": "overflow" },
+  { "model": "opencode-go/longcat-2.5-preview-free", "tier": "overflow" }
+] }
+```
+
+Do **not** also edit the variant agents in `opencode.jsonc` — they carry no `model` on
+purpose. The plugin's config hook writes `<base>-<slot>` for `explore-fast`,
+`implement-fast` and `context-manager` from this file, and adds any missing provider
+whitelist entry. A `model` that reappears on a variant is stale: the plugin logs
+`still hard-codes … pool-models.json wins` on every start.
+
+Keep the provider configured in `opencode.jsonc` and the models free and tool-call
+capable — check with `curl -sS https://models.dev/api.json` or `opencode models
+<provider>`. Then restart every opencode process and confirm what is actually live:
+
+```bash
+opencode debug agent explore-fast-1   # model it resolved
+opencode run "pool_status"            # slots, load, cooldowns
+```
+
+Failure modes are logged, never silent: a bad entry (no `provider/model-id`, an unknown
+tier, a repeated model) is dropped with a warning and the other slots still route; a file
+that yields nothing usable falls back to the built-in defaults. Both appear in the log as
+`pool-models.json …`, so check
+`tail -f ~/.local/share/opencode/log/opencode.log | grep pool-models` when a spawn
+resolves to the wrong model. If the plugin is disabled (`opencode --pure`) the variants
+have no model at all and inherit the session's — check the plugin is loading before
+debugging a wrong model.
+
 ## Restarts
 
-**Plugins are not hot-reloaded.** Any change to `opencode.jsonc`, `lib/`, or `plugins/`
-requires restarting every opencode process. Servers are foreground processes with no
+**Plugins are not hot-reloaded.** Any change to `pool-models.json`, `opencode.jsonc`,
+`lib/`, or `plugins/` requires restarting every opencode process. Servers are foreground processes with no
 systemd unit or tmux session, so each is restarted from its own terminal.
 
 This bites in a specific way: a config change is invisible until restart, so a fix can
-look applied and still not be running. Always check `ps -eo pid,lstart,comm | grep opencode`
+look applied and still not be running. Swapping a pool model is where it matters most:
+the file says one thing, a long-running server keeps routing to the old one. Always check `ps -eo pid,lstart,comm | grep opencode`
 against the file mtime before concluding a change is live.
 
 ## Deploying to the other hosts
@@ -60,12 +100,16 @@ against the file mtime before concluding a change is live.
 Pushes `opencode.jsonc`, `lib/`, `plugins/`, `.opencode/` — with a remote backup first.
 Two ordering and scope rules that are easy to get wrong:
 
-- **`lib/` must land before `plugins/`.** Both plugins import `../lib/pool.ts`; a
-  plugins-first sync leaves them unable to resolve on next restart.
+- **`lib/` must land before `plugins/`.** Both plugins import from `../lib/`; a
+  plugins-first sync leaves them unable to resolve on next restart. `lib/` must also keep
+  exporting **no plugin**: opencode calls every export of every file in `plugins/` as a
+  plugin and uses the return value as a hooks object, so a helper left there is a broken
+  plugin. One did exactly that (`verifyWriterRule`) and opencode stopped starting.
 - **`node_modules`, `package-lock.json`, and `tests/` are not synced.** Each host keeps
-  its own install and SDK version. Consequence: the `1.16.2` pin in `package.json` is
+  its own install and SDK version. Consequence: the `1.18.34` pin in `package.json` is
   **not** enforced anywhere — it is documentation, not a constraint. Verify the SDK
-  version on a host before assuming parity.
+  version on a host before assuming parity, and keep it equal to that host's opencode
+  binary version.
 
 Remotes are plain rsync copies with no `.git`, so they carry no history. Local is the
 only place edits are made; a remote-side change is untracked and will be overwritten by
@@ -94,11 +138,17 @@ Two operational rules:
 - **A `finished` log line is not evidence the map changed.** A run blocked from writing
   resolves identically to a successful one. The plugin now reports `changed: N`, counts
   files that actually moved on disk, and warns at `changed: 0`.
-- **If the map goes stale, check the one-writer permission rule first.** opencode matches
-  permission patterns against the *resolved absolute* path, so a rule written relative to
-  the project root silently never fires. It must be `*/.opencode/context/**`. The plugin
-  now verifies this at startup and logs an error naming the offending rule;
-  `tests/permission-test.mjs` pins it, including against the real `opencode.jsonc`.
+- **If the map goes stale, check the one-writer permission rule first.** opencode evaluates
+  file permissions against the path **relative to the project root**, not the absolute path
+  the tool was handed — a write of `/repo/.opencode/context/architecture.md` is evaluated as
+  `.opencode/context/architecture.md`. Patterns are anchored, so neither spelling covers
+  every project on its own: `.opencode/context/**` fires for a normally-rooted project but
+  not when the project root is `/`, and `*/.opencode/context/**` fires *only* when it is.
+  **Both are required.** A relative-only rule was silently broken first; "fixing" it to the
+  absolute form (`6f6af0a`) silently broke it again, because the detector was checking the
+  absolute path too. `lib/writer-rule.ts` now checks the form that applies to the running
+  project's root and logs an error naming the offending rule; `tests/permission-test.mjs`
+  pins both directions, including against the real `opencode.jsonc`.
 
 Force a run with `/context-update` rather than waiting for the idle trigger.
 
