@@ -74,6 +74,17 @@ resolves to the wrong model. If the plugin is disabled (`opencode --pure`) the v
 have no model at all and inherit the session's — check the plugin is loading before
 debugging a wrong model.
 
+## Restarts
+
+**Plugins are not hot-reloaded.** Any change to `pool-models.json`, `opencode.jsonc`,
+`lib/`, or `plugins/` requires restarting every opencode process. Servers are foreground processes with no
+systemd unit or tmux session, so each is restarted from its own terminal.
+
+This bites in a specific way: a config change is invisible until restart, so a fix can
+look applied and still not be running. Swapping a pool model is where it matters most:
+the file says one thing, a long-running server keeps routing to the old one. Always check `ps -eo pid,lstart,comm | grep opencode`
+against the file mtime before concluding a change is live.
+
 ## Why opencode.jsonc is ~730 lines
 
 Audited, and most of it is structural rather than redundant:
@@ -89,26 +100,24 @@ Audited, and most of it is structural rather than redundant:
   four variants per base meant adding a line to two agents for every new slot.
 - **The models are not here at all** — `pool-models.json` owns them and the plugin
   injects them.
-- `mcp.playwright` plus the `playwright_*` grants on the explore and implement agents are
-  deliberate: those agents may drive a browser even though no prompt mentions it. The
-  per-agent grant uses the deprecated `tools` field on purpose — the schema points at
-  `permission`, but the tool must survive the global `tools.playwright_*: false`.
+- Playwright stays: the explore and implement agents may drive a browser even though
+  no prompt says so. The per-agent grant uses the deprecated `tools` field on purpose.
+  The schema points at `permission`, but `permission` has no entry for MCP tools, and
+  `opencode debug agent` never lists MCP tools at all -- so neither it nor the schema can
+  confirm a working grant. Verified end to end instead: `explore-fast-3` reports all 26
+  `playwright_browser_*` tools, and the top-level `tools.playwright_*: false` keeps them
+  away from every other agent.
+- `explore`, `general` and `implement` are disabled. These are opencode's built-in
+  generic subagents; they would always be spawnable, cost a full-price model, and bypass
+  `explore-fast*` / `implement-fast*` entirely. Only `basic`, `expert`, the pool bases and
+  their variants, and the deep agents remain. `pool-test.mjs` pins this, so an opencode
+  upgrade that reintroduces a built-in fails there rather than quietly doubling the
+  delegation paths.
 | `bin/oc`, `bin/oc-sync` | the `oc` launcher and the deploy script, both in the repo; `~/bin/oc` and `~/bin/oc-sync` are symlinks to them |
 | `.env` / `.env.example` | host list and deploy overrides — `.env` is gitignored, `.env.example` documents every variable |
 | `~/.local/share/opencode/agent-pool/` | live cross-process claims + cooldowns |
 | `~/.local/share/opencode/auth.json` | credentials — deliberately **outside** this repo |
 | `.opencode/context/` | this project's context map — derived, not in git (see below) |
-
-## Restarts
-
-**Plugins are not hot-reloaded.** Any change to `pool-models.json`, `opencode.jsonc`,
-`lib/`, or `plugins/` requires restarting every opencode process. Servers are foreground processes with no
-systemd unit or tmux session, so each is restarted from its own terminal.
-
-This bites in a specific way: a config change is invisible until restart, so a fix can
-look applied and still not be running. Swapping a pool model is where it matters most:
-the file says one thing, a long-running server keeps routing to the old one. Always check `ps -eo pid,lstart,comm | grep opencode`
-against the file mtime before concluding a change is live.
 
 ## Deploying to the other hosts
 

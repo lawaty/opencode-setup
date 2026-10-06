@@ -205,6 +205,21 @@ for (const [name, def] of Object.entries(rawCfg.agent)) {
   }
 }
 
+// 10c. the generic built-in subagents must stay disabled. "explore" and "general"
+//      shadow the pool: always spawnable, full-price, and a bypass around
+//      explore-fast*/implement-fast*. Pinned so an opencode upgrade that
+//      reintroduces (or adds) one fails here rather than quietly doubling the
+//      delegation paths.
+for (const builtin of ["explore", "general", "implement"]) {
+  assert(rawCfg.agent[builtin]?.disable === true, `${builtin} must be disabled in opencode.jsonc`)
+}
+// Only the pool's implement variants may be real agents; a bare "implement" must
+// stay disabled, so it must not be declared with anything but disable.
+for (const [name, def] of Object.entries(rawCfg.agent)) {
+  if (!/^implement(-|$)/.test(name) || name.startsWith("implement-")) continue
+  assert(def.disable === true, `${name} must not be a usable agent`)
+}
+
 // 11. all four pool models are free (0/0 cost) per the vendored models.dev
 //     snapshot, which is refreshed with: curl -sS https://models.dev/api.json
 assert(existsSync(SNAPSHOT), `missing ${SNAPSHOT}; re-fetch models.dev to rebuild it`)
