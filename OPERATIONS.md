@@ -121,6 +121,14 @@ bin/oc-sync --host <alias>          # one host
 Pushes `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/` — with a
 remote backup first.
 
+A failed transfer is a failure, not a detail: every rsync's exit status is checked
+before its output is filtered, and the host is listed under `failed` with the
+directory left behind so you know what state it is in. `--dry-run` writes nothing at
+all, locally or on the remote — it reports the `~/bin` PATH line, `OC_LOCAL_USER` and
+`authorized_keys` entries it *would* add. `.opencode/context/` is excluded from the
+transfer: it is the derived map of whatever projects a host works on, so each host
+regenerates its own.
+
 **Host details live in `.env`, not in the repo.** The repo is public, so `bin/oc-sync`
 carries no names, addresses or usernames: it reads `OC_HOSTS` (whitespace, comma or
 newline separated) and optional overrides from `.env`, which `.gitignore` keeps out of

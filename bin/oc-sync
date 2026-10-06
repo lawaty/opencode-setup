@@ -69,15 +69,34 @@ bad()  { printf '  \xe2\x9c\x97 %s\n' "$*"; }
 warn() { printf '  \xe2\x9a\xa0 %s\n' "$*"; }
 
 # rsync with the same ssh options, and --dry-run folded in. rsync's progress
-# lines are noise here; a failing transfer still surfaces through the caller's
-# own exit check.
+# lines are noise here, but the transfer's exit status is the whole point: a
+# filtered pipe reports success for a transfer that never happened, so the
+# status is captured before filtering and returned to the caller.
 rsync_to() {
   local src="$1" dest="$2"
+  shift 2
   local args=(-az --no-owner --no-group)
   [[ $DRY_RUN -eq 1 ]] && args+=(-n)
-  timeout "$RSYNC_TIMEOUT" rsync "${args[@]}" \
+  local out="" status=0
+  out="$(timeout "$RSYNC_TIMEOUT" rsync "${args[@]}" "$@" \
     -e "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15" \
-    "$src" "$dest" 2>&1 | grep -vE 'using port|^$|^sending |^sent |^total size' || true
+    "$src" "$dest" 2>&1)" || status=$?
+  printf '%s\n' "$out" | grep -vE 'using port|^$|^sending |^sent |^total size' || true
+  return "$status"
+}
+
+# One rsync, with its failure reported and remembered, so a half-synced host can
+# never be announced as done.
+push() {
+  local label="$1" src="$2" dest="$3"
+  shift 3
+  if rsync_to "$src" "$dest" "$@"; then
+    ok "$label synced"
+    return 0
+  fi
+  bad "rsync of $label FAILED ($src -> $dest) - remote copy is not up to date"
+  FAILED+=("$HOST")
+  return 1
 }
 
 # Host list: OC_HOSTS (whitespace or newline separated) wins, else the legacy
@@ -103,13 +122,15 @@ for F in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecds
 done
 if [[ -n "$LOCAL_KEY_FILE" ]]; then
   LOCAL_KEY="$(cat "$LOCAL_KEY_FILE")"
-  if ! grep -qxF "$LOCAL_KEY" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+  if grep -qxF "$LOCAL_KEY" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+    ok "local key already in ~/.ssh/authorized_keys"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    ok "[dry-run] would add your local public key to ~/.ssh/authorized_keys (for tunnel auth)"
+  else
     mkdir -p "$HOME/.ssh"
     printf '%s\n' "$LOCAL_KEY" >> "$HOME/.ssh/authorized_keys"
     chmod 600 "$HOME/.ssh/authorized_keys"
     ok "added your local public key to ~/.ssh/authorized_keys (for tunnel auth)"
-  else
-    ok "local key already in ~/.ssh/authorized_keys"
   fi
 else
   warn "no SSH public key found locally - generate one with ssh-keygen"
@@ -125,37 +146,39 @@ fi
 # and set OC_LOCAL_USER. Prints "oc-sync|..." lines the caller renders.
 remote_prepare() {
   local host="$1"
-  timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s -- "$LOCAL_USER" <<'REMOTE'
+  timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s -- "$LOCAL_USER" "$DRY_RUN" <<'REMOTE'
 set -u
 LOCAL_USER="$1"
+# 1 = preview only: every mutation below is reported instead of performed, so
+# that "nothing was written" is true of the remote host too.
+DRY="$2"
 emit() { echo "oc-sync|$1"; }
-mkdir -p ~/bin 2>/dev/null && emit "ok:ensured ~/bin exists" || emit "err:could not create ~/bin"
+# add_line <rc-file> <exact-line> <what>
+add_line() {
+  [ -f ~/"$1" ] || return 0
+  if grep -qxF "$2" ~/"$1" 2>/dev/null; then
+    emit "ok:$3 already in ~${1}"
+  elif [ "$DRY" = "1" ]; then
+    emit "ok:[dry-run] would add $3 to ~${1}"
+  elif printf '%s\n' "$2" >> ~/"$1" 2>/dev/null; then
+    emit "ok:$3 added to ~${1}"
+  else
+    emit "warn:could not update ~${1}"
+  fi
+}
+if [ "$DRY" = "1" ]; then
+  if [ -d ~/bin ]; then emit "ok:~/bin exists"; else emit "ok:[dry-run] would create ~/bin"; fi
+else
+  mkdir -p ~/bin 2>/dev/null && emit "ok:ensured ~/bin exists" || emit "err:could not create ~/bin"
+fi
 case ":${PATH}:" in
   *":${HOME}/bin:"*) emit "ok:~/bin already in PATH" ;;
   *)
     PATH_LINE='export PATH="$HOME/bin:$PATH"'
-    for RC in .bashrc .profile; do
-      [ -f ~/"$RC" ] || continue
-      if grep -qxF "$PATH_LINE" ~/"$RC" 2>/dev/null; then
-        emit "ok:~/bin already in ~${RC}"
-      elif printf '%s\n' "$PATH_LINE" >> ~/"$RC" 2>/dev/null; then
-        emit "ok:~/bin added to ~${RC}"
-      else
-        emit "warn:could not update ~${RC}"
-      fi
-    done ;;
+    for RC in .bashrc .profile; do add_line "$RC" "$PATH_LINE" "~/bin PATH"; done ;;
 esac
 OC_LINE="export OC_LOCAL_USER=${LOCAL_USER}"
-for RC in .bashrc .profile; do
-  [ -f ~/"$RC" ] || continue
-  if grep -qxF "$OC_LINE" ~/"$RC" 2>/dev/null; then
-    emit "ok:OC_LOCAL_USER already set in ~${RC}"
-  elif printf '%s\n' "$OC_LINE" >> ~/"$RC" 2>/dev/null; then
-    emit "ok:OC_LOCAL_USER=${LOCAL_USER} added to ~${RC}"
-  else
-    emit "warn:could not set OC_LOCAL_USER in ~${RC}"
-  fi
-done
+for RC in .bashrc .profile; do add_line "$RC" "$OC_LINE" "OC_LOCAL_USER=${LOCAL_USER}"; done
 REMOTE
 }
 
@@ -219,26 +242,24 @@ for HOST in "${HOSTS[@]}"; do
       # plugins-first sync would leave them unable to resolve on next restart.
       if [[ -d "$CONFIG_DIR/lib" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/lib' >/dev/null 2>&1
-        rsync_to "$CONFIG_DIR/lib/" "${HOST}:~/.config/opencode/lib/"
-        ok "lib/ synced"
+        push "lib/" "$CONFIG_DIR/lib/" "${HOST}:~/.config/opencode/lib/" || continue
       fi
-      rsync_to "$CONFIG_DIR/opencode.jsonc"  "${HOST}:~/.config/opencode/"
-      ok "opencode.jsonc synced"
+      push "opencode.jsonc" "$CONFIG_DIR/opencode.jsonc" "${HOST}:~/.config/opencode/" || continue
       # pool-models.json decides which models the pool runs: lib/ and plugins/ read it,
       # so a host missing it silently falls back to the built-in defaults.
       if [[ -f "$CONFIG_DIR/pool-models.json" ]]; then
-        rsync_to "$CONFIG_DIR/pool-models.json" "${HOST}:~/.config/opencode/"
-        ok "pool-models.json synced"
+        push "pool-models.json" "$CONFIG_DIR/pool-models.json" "${HOST}:~/.config/opencode/" || continue
       fi
       if [[ -d "$CONFIG_DIR/plugins" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1
-        rsync_to "$CONFIG_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/"
-        ok "plugins/ synced"
+        push "plugins/" "$CONFIG_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" || continue
       fi
       if [[ -d "$CONFIG_DIR/.opencode" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/.opencode' >/dev/null 2>&1
-        rsync_to "$CONFIG_DIR/.opencode/" "${HOST}:~/.config/opencode/.opencode/"
-        ok ".opencode/ synced"
+        # .opencode/context/ is the derived map of whatever projects a host
+        # works on, so each host regenerates its own and it is never shipped.
+        push ".opencode/" "$CONFIG_DIR/.opencode/" "${HOST}:~/.config/opencode/.opencode/" \
+          --exclude='.opencode/context/' || continue
       fi
       # node_modules / package-lock.json / tests/ are intentionally not synced:
       # each host keeps its own install and SDK version.
@@ -247,6 +268,17 @@ for HOST in "${HOSTS[@]}"; do
 
   ok "done"
   DONE+=("$HOST")
+done
+
+# A host that neither finished nor recorded a failure was skipped by something
+# unexpected (a missing helper, say). Never report that as success.
+for HOST in "${HOSTS[@]}"; do
+  case " ${DONE[*]-} ${FAILED[*]-} " in
+    *" $HOST "*) ;;
+    *) [[ -n "$ONLY_HOST" && "$HOST" != "$ONLY_HOST" ]] && continue
+       bad "host $HOST was neither synced nor marked failed"
+       FAILED+=("$HOST") ;;
+  esac
 done
 
 echo
