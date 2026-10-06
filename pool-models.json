@@ -9,8 +9,10 @@
     "Rules, all validated at startup: models are written provider/model-id, must be distinct,",
     "and tier must be primary or overflow. primary slots are kept equal and hold a lead of 2",
     "over the least-loaded overflow slot; primaries are used first, overflow after.",
-    "Keep the models free (0/0 cost) and tool-call capable: check them against models.dev",
-    "(curl -sS https://models.dev/api.json, snapshot in tests/models-snapshot.json).",
+    "Keep the models free (0/0 cost) and tool-call capable. After editing this file run",
+    "  node tests/refresh-models-snapshot.mjs",
+    "which re-checks every slot against models.dev and records the result in",
+    "tests/models-snapshot.json. Skipping it fails the pool tests on the new model.",
     "",
     "Changing this file requires restarting every opencode process: plugins are not hot-reloaded."
   ],

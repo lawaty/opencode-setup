@@ -80,11 +80,15 @@ const providers = new Set(shipped.slots.map((s) => s.model.split("/")[0]))
 assert(providers.size >= 2, `the pool must span at least two providers, got ${[...providers].join(", ")}`)
 
 // 2. a different file rewrites every variant agent, even against a config that
-//    names different models and carries no whitelist entry for the new ones
+//    names different models and carries no whitelist entry for the new ones.
+//    The fixture must name models opencode.jsonc has never heard of (that is
+//    what proves auto-whitelisting), so it invents ids and borrows only the
+//    provider names, which must exist in the config for the hook to touch them.
+const [PROV_A, PROV_B] = [...providers]
 const swapped = [
-  { model: "opencode/big-pickle", tier: "primary" },
-  { model: "opencode-go/brand-new-free", tier: "primary" },
-  { model: "opencode/nemotron-3-ultra-free", tier: "overflow" },
+  { model: `${PROV_A}/fixture-primary-a`, tier: "primary" },
+  { model: `${PROV_B}/fixture-primary-b`, tier: "primary" },
+  { model: `${PROV_A}/fixture-overflow-c`, tier: "overflow" },
 ]
 const a = await apply(file("swapped.json", { slots: swapped }))
 for (const base of BASES) {
@@ -103,12 +107,17 @@ for (const slot of swapped) {
   assert(a.cfg.provider[provider].whitelist.includes(id), `${slot.model} must be whitelisted on ${provider}`)
 }
 assert(
-  a.lines.some((l) => l.includes("whitelisted") && l.includes("brand-new-free")),
+  a.lines.some((l) => l.includes("whitelisted") && l.includes("fixture-primary-b")),
   `adding a model to a provider whitelist should be logged, got ${a.lines.join(" | ")}`,
 )
-// an already-whitelisted model is added exactly once
-const repeats = a.cfg.provider.opencode.whitelist.filter((x) => x === "big-pickle")
-assert(repeats.length === 1, `whitelist entry must not be duplicated, got ${repeats.length}`)
+// an already-whitelisted model is added exactly once: run the same file again and
+// check no id is duplicated. Which model to use is the shipped file's business.
+const second = await apply(file("swapped-again.json", { slots: swapped }), "swapped-again")
+for (const slot of swapped) {
+  const [provider, id] = slot.model.split("/")
+  const seen = second.cfg.provider[provider].whitelist.filter((x) => x === id).length
+  assert(seen <= 1, `${slot.model} must not be whitelisted twice, got ${seen}`)
+}
 
 // 4. a three-slot file routes only 1,2,3 -- the slot count is data, not code
 const picks = []
@@ -123,14 +132,20 @@ const fallbackPick = await missing.spawn("f1")
 assert(fallbackPick === "explore-fast-1", `defaults should still route, got ${fallbackPick}`)
 
 // 6. individual bad entries are dropped with a warning; the good slots still route
+// Three rejection rules under test, each needing a distinct violation: a repeat of
+// slot 1's model, a tier that is neither primary nor overflow, and a model with no
+// provider prefix. So the fixture needs three distinct models, one of which is a
+// deliberate repeat of a good one.
+const GOOD_1 = `${PROV_A}/fixture-good-1`
+const GOOD_2 = `${PROV_B}/fixture-good-2`
 const broken = await apply(
   file("broken.json", {
     slots: [
-      { model: "opencode/big-pickle", tier: "primary" },
-      { model: "opencode/big-pickle", tier: "overflow" },
-      { model: "opencode/nemotron-3-ultra-free", tier: "sideways" },
-      { model: "opencode/nemotron-3-ultra-free", tier: "overflow" },
-      { model: "nemotron-3-ultra-free", tier: "primary" },
+      { model: GOOD_1, tier: "primary" },
+      { model: GOOD_1, tier: "overflow" },
+      { model: GOOD_2, tier: "sideways" },
+      { model: `${PROV_B}/fixture-good-3`, tier: "overflow" },
+      { model: "fixture-no-provider", tier: "primary" },
     ],
   }),
   "broken",
@@ -138,8 +153,8 @@ const broken = await apply(
 const warns = broken.warned().filter((l) => l.includes("pool-models.json") || l.includes("slot "))
 assert(warns.length === 3, `each bad entry should warn once, got ${warns.length}: ${warns.join(" | ")}`)
 for (const base of BASES) {
-  assert(broken.cfg.agent[`${base}-1`].model === "opencode/big-pickle", `slot 1 must run the first valid entry, got ${broken.cfg.agent[`${base}-1`].model}`)
-  assert(broken.cfg.agent[`${base}-2`].model === "opencode/nemotron-3-ultra-free", `slot 2 must run the second valid entry, got ${broken.cfg.agent[`${base}-2`].model}`)
+  assert(broken.cfg.agent[`${base}-1`].model === GOOD_1, `slot 1 must run the first valid entry, got ${broken.cfg.agent[`${base}-1`].model}`)
+  assert(broken.cfg.agent[`${base}-2`].model === `${PROV_B}/fixture-good-3`, `slot 2 must run the second valid entry, got ${broken.cfg.agent[`${base}-2`].model}`)
 }
 
 // 7. opencode.jsonc declares the variants with no model at all: the hook is the

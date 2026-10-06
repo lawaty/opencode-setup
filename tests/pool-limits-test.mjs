@@ -11,6 +11,24 @@ const CONFIG = join(HERE, "..", "opencode.jsonc")
 const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
+// pool-models.json owns the pool's models; the provider/modelID pairs every
+// limit event needs are split from it, so swapping a model is not a test edit.
+// Slots are also looked up by tier, since the tests care about "a primary" and
+// "an overflow", not about which number either happens to be.
+const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots.map((s, i) => {
+  const [provider, modelID] = s.model.split("/")
+  return { model: s.model, provider, modelID, tier: s.tier, index: i + 1 }
+})
+const SLOT_MODELS = SLOTS.map((s) => s.model)
+const variantOf = (slot) => `explore-fast-${slot.index}`
+const primary = () => SLOTS.find((s) => s.tier === "primary")
+const overflow = () => SLOTS.find((s) => s.tier === "overflow")
+// model ids go into RegExp sources all over this file
+const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
+// A stated reset and a retry-after header are about the error shape, not about
+// any particular model, so these use an id the pool never runs.
+const FOREIGN = { provider: "fixture-provider", modelID: "fixture-model" }
+
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
 let aborted = []
@@ -64,38 +82,45 @@ const dirB = scratch()
 // 1. a rate-limit error message cools the model and routing avoids it
 {
   const a = await mk("p1", dirA)
-  assert((await a.spawn("a1")) === "explore-fast-1", "baseline routes to first primary")
-  await a.limitEvent("opencode", "big-pickle", rateError("Rate limit exceeded. Please try again later."))
+  // Baseline first: an idle pool hands out a primary. Cool whichever model that
+  // spawn actually claimed (read back from the pool, not guessed from the file),
+  // so this holds whatever pool-models.json names and in whatever order.
+  const baseline = await a.spawn("a1")
+  const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
+  assert(slot?.tier === "primary", `baseline must route to a primary, got ${baseline}`)
+  await a.limitEvent(slot.provider, slot.modelID, rateError("Rate limit exceeded. Please try again later."))
   const after = []
   for (let i = 0; i < 6; i++) after.push(await a.spawn(`a${i + 2}`))
-  assert(!after.includes("explore-fast-1"), `cooled primary must be skipped, got ${after.join(",")}`)
-  assert(after.includes("explore-fast-2"), "other primary must still take work")
+  assert(!after.includes(baseline), `cooled primary must be skipped, got ${after.join(",")}`)
+  // a remaining primary must still take work
+  const spare = SLOTS.filter((s) => s.tier === "primary" && s.model !== slot.model)
+  if (spare.length > 0) assert(after.includes(variantOf(spare[0])), `${variantOf(spare[0])} must still take work`)
   assert(/COOLING/.test(await a.status()), "status must flag the cooling model")
-  assert(/cooling: opencode\/big-pickle/.test(await a.status()), "status must name the cooling model")
+  assert(new RegExp(`cooling: ${escape(slot.model)}\\b`).test(await a.status()), "status must name the cooling model")
 }
 
 // 2. unrelated errors must NOT cool anything
 {
   const b = await mk("p2", dirB)
-  await b.limitEvent("opencode", "big-pickle", rateError("connection reset by peer"))
-  await b.limitEvent("opencode", "big-pickle", { name: "UnknownError", data: { message: "tool call malformed" } })
+  await b.limitEvent(primary().provider, primary().modelID, rateError("connection reset by peer"))
+  await b.limitEvent(primary().provider, primary().modelID, { name: "UnknownError", data: { message: "tool call malformed" } })
   assert(!/COOLING/.test(await b.status()), "non-limit errors must not trigger a cooldown")
 }
 
 // 3. a stated reset time wins over the exponential guess
 {
   const c = await mk("p3", scratch())
-  await c.limitEvent("opencode-go", "glm-5.2", rateError("5-hour usage limit reached. Resets in 35min."))
+  await c.limitEvent(FOREIGN.provider, FOREIGN.modelID, rateError("5-hour usage limit reached. Resets in 35min."))
   const status = await c.status()
-  const seconds = Number(/glm-5\.2 for (\d+)s/.exec(status)?.[1])
+  const seconds = Number(new RegExp(`${FOREIGN.modelID} for (\\d+)s`).exec(status)?.[1])
   assert(seconds > 2000 && seconds <= 2100, `stated 35min cooldown should be honoured, got ${seconds}s`)
 }
 
 // 4. retry-after response header is honoured
 {
   const d = await mk("p4", scratch())
-  await d.limitEvent("opencode", "nemotron-3-ultra-free", rateError("too many requests", { responseHeaders: { "retry-after": "120" } }))
-  const seconds = Number(/nemotron-3-ultra-free for (\d+)s/.exec(await d.status())?.[1])
+  await d.limitEvent(FOREIGN.provider, FOREIGN.modelID, rateError("too many requests", { responseHeaders: { "retry-after": "120" } }))
+  const seconds = Number(new RegExp(`${FOREIGN.modelID} for (\\d+)s`).exec(await d.status())?.[1])
   assert(seconds > 110 && seconds <= 120, `retry-after should set a 120s cooldown, got ${seconds}s`)
 }
 
@@ -103,10 +128,11 @@ const dirB = scratch()
 {
   const e = await mk("p5", scratch())
   const err = rateError("Rate limit exceeded")
-  await e.limitEvent("opencode-go", "longcat-2.5-preview-free", err)
-  const first = Number(/longcat[^ ]* for (\d+)s/.exec(await e.status())?.[1])
-  await e.limitEvent("opencode-go", "longcat-2.5-preview-free", err)
-  const second = Number(/longcat[^ ]* for (\d+)s/.exec(await e.status())?.[1])
+  const slot = primary()
+  await e.limitEvent(slot.provider, slot.modelID, err)
+  const first = Number(new RegExp(`${slot.modelID} for (\\d+)s`).exec(await e.status())?.[1])
+  await e.limitEvent(slot.provider, slot.modelID, err)
+  const second = Number(new RegExp(`${slot.modelID} for (\\d+)s`).exec(await e.status())?.[1])
   assert(second === first * 2, `second strike should double the cooldown (${first}s -> ${second}s)`)
   assert(/strike 2/.test(await e.status()), "status should show the strike count")
 }
@@ -115,13 +141,13 @@ const dirB = scratch()
 {
   const dir = scratch()
   const f = await mk("p6", dir)
-  await f.spawn("f1")
+  const hung = await f.spawn("f1") // the slot that will hang
   await f.hooks.event({ event: { type: "session.created", properties: { info: { id: "child-x", parentID: "s1" } } } })
   const realNow = Date.now
   Date.now = () => realNow() + 9 * 60 * 1000
   const next = await f.spawn("f2")
   Date.now = realNow
-  assert(next !== "explore-fast-1", `a hung claim must free its slot and cool the model, got ${next}`)
+  assert(next !== hung, `a hung claim must free its slot and cool the model, got ${next}`)
   assert(/hang/.test(await f.status()), "status should attribute the recovery to a hang")
 }
 
@@ -129,18 +155,19 @@ const dirB = scratch()
 {
   const g = await mk("writer", dirA)
   const h = await mk("reader", dirA)
-  await g.limitEvent("opencode-go", "space-bunny-free", rateError("Rate limit exceeded"))
+  const slot = primary()
+  await g.limitEvent(slot.provider, slot.modelID, rateError("Rate limit exceeded"))
   assert(/COOLING/.test(await h.status()), "a peer process must observe a cooldown written by another")
   const picks = []
   for (let i = 0; i < 4; i++) picks.push(await h.spawn(`h${i}`))
-  assert(!picks.includes("explore-fast-2"), `peer must avoid the cooled model, got ${picks.join(",")}`)
+  assert(!picks.includes(variantOf(slot)), `peer must avoid the cooled model, got ${picks.join(",")}`)
 }
 
 // 8. expired cooldown files are pruned, not honoured forever
 {
   const dir = scratch()
   const i = await mk("p8", dir)
-  await i.limitEvent("opencode", "big-pickle", rateError("Rate limit exceeded"))
+  await i.limitEvent(primary().provider, primary().modelID, rateError("Rate limit exceeded"))
   assert(readdirSync(dir).some((f) => f.startsWith("limit.")), "a cooldown file should be written")
   const realNow = Date.now
   Date.now = () => realNow() + 16 * 60 * 1000
@@ -152,13 +179,8 @@ const dirB = scratch()
 // 9. routing still works when every model is cooling (must not refuse to route)
 {
   const j = await mk("p9", scratch())
-  for (const [providerID, modelID] of [
-    ["opencode", "big-pickle"],
-    ["opencode-go", "space-bunny-free"],
-    ["opencode", "nemotron-3-ultra-free"],
-    ["opencode-go", "longcat-2.5-preview-free"],
-  ])
-    await j.limitEvent(providerID, modelID, rateError("Rate limit exceeded"))
+  for (const { provider, modelID } of SLOTS)
+    await j.limitEvent(provider, modelID, rateError("Rate limit exceeded"))
   const pick = await j.spawn("j1")
   assert(/^explore-fast-[1-4]$/.test(pick), `must still route when all models cool, got ${pick}`)
 }
@@ -166,7 +188,9 @@ const dirB = scratch()
 // 10. catalog status gates retired models (simulated by seeding serverUrl-less state)
 {
   const k = await mk("p10", scratch())
-  assert(/slot 3/.test(await k.status()) && /slot 4/.test(await k.status()), "overflow slots must be listed in status")
+  for (const slot of SLOTS.filter((s) => s.tier === "overflow")) {
+    assert(new RegExp(`slot ${slot.index}\\b`).test(await k.status()), `overflow slot ${slot.index} must be listed in status`)
+  }
   assert(existsSync(PLUGIN), "plugin file must exist")
 }
 

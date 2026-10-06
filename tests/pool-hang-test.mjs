@@ -12,6 +12,10 @@ const CONFIG = join(HERE, "..", "opencode.jsonc")
 const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
+// pool-models.json owns the pool's models, so the model a hang cools is read
+// from it rather than repeated here.
+const [SLOT_PROVIDER, SLOT_MODEL_ID] = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots[0].model.split("/")
+
 let failures = 0
 const assert = (cond, msg) => {
   if (!cond) {
@@ -127,8 +131,8 @@ const { AgentPool } = await import(PLUGIN)
       properties: {
         info: {
           role: "assistant",
-          providerID: "opencode",
-          modelID: "big-pickle",
+          providerID: SLOT_PROVIDER,
+          modelID: SLOT_MODEL_ID,
           error: { name: "APIError", data: { message: "5-hour usage limit reached. Resets in 40min.", isRetryable: false } },
         },
       },
@@ -138,7 +142,7 @@ const { AgentPool } = await import(PLUGIN)
   await t.childCreated("parent", "child-reset")
   clock = 10 * 60_000
   await t.spawn("s2", "parent")
-  const seconds = Number(/opencode\/big-pickle for (\d+)s/.exec(await t.status())?.[1])
+  const seconds = Number(new RegExp(`${SLOT_PROVIDER}/${SLOT_MODEL_ID} for (\\d+)s`).exec(await t.status())?.[1])
   assert(seconds > 1700 && seconds <= 1800, `hang must reuse the stated 40min reset (30min left), got ${seconds}s`)
 }
 

@@ -13,6 +13,15 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
+// pool-models.json owns the pool's models. Test 4 is about a provider-wide
+// cooldown, so it is written against whichever provider slot 1 runs on and the
+// slots on the other providers, rather than against fixed model names.
+const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
+const [HOT_PROVIDER, HOT_MODEL] = SLOTS[0].model.split("/") // provider whose free tier fills up
+const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
+const sameProvider = SLOTS.filter((s) => s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => s.model)
+const otherProviders = SLOTS.filter((s) => !s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => s.model.split("/")[1])
+
 let failures = 0
 const assert = (cond, msg) => {
   if (!cond) {
@@ -109,9 +118,9 @@ const settle = () => new Promise((r) => setTimeout(r, 120))
   ]
   for (const [i, error] of shapes.entries()) {
     await t.hooks.event({
-      event: { type: "message.updated", properties: { info: { role: "assistant", providerID: "opencode", modelID: "big-pickle", error } } },
+      event: { type: "message.updated", properties: { info: { role: "assistant", providerID: HOT_PROVIDER, modelID: HOT_MODEL, error } } },
     })
-    assert(t.logs.some((l) => l.includes("cooling opencode/big-pickle")), `error shape ${i + 1} should have triggered a cooldown`)
+    assert(t.logs.some((l) => l.includes(`cooling ${HOT_PROVIDER}/${HOT_MODEL}`)), `error shape ${i + 1} should have triggered a cooldown`)
   }
   await t.hooks.dispose?.()
 }
@@ -132,21 +141,29 @@ const settle = () => new Promise((r) => setTimeout(r, 120))
           attempt: 1,
           message: "Free usage exceeded, subscribe to Go",
           next: until,
-          action: { reason: "free_tier_limit", provider: "opencode" },
+          action: { reason: "free_tier_limit", provider: HOT_PROVIDER },
         },
       },
     },
   })
   const status = await t.status()
-  assert(/cooling: opencode\/big-pickle/.test(status), `the Zen primary must cool, got:\n${status}`)
-  assert(/opencode\/nemotron-3-ultra-free for \d+s/.test(status), `the Zen overflow slot must cool too, got:\n${status}`)
-  assert(!/opencode-go\/(space-bunny-free|longcat)/.test(status.split("cooling:")[1] ?? ""), `opencode-go slots must stay usable, got:\n${status}`)
-  const seconds = Number(/opencode\/big-pickle for (\d+)s/.exec(status)?.[1])
+  // The cooling list is one comma-separated line, so match each model inside it
+  // rather than expecting each to start its own "cooling:" entry.
+  const cooling = (status.split("cooling:")[1] ?? "").trim()
+  // every slot on that provider cools, whatever the model is and which slot it is
+  for (const model of sameProvider) {
+    assert(new RegExp(`(^|, )${escape(model)} for \\d+s`).test(cooling), `${model} must cool with a window, got:\n${status}`)
+  }
+  for (const model of otherProviders) {
+    assert(!new RegExp(`(^|, )${escape(model)} for \\d+s`).test(cooling), `${model} runs on another provider and must stay usable, got:\n${status}`)
+  }
+  const seconds = Number(new RegExp(`${escape(`${HOT_PROVIDER}/${HOT_MODEL}`)} for (\\d+)s`).exec(status)?.[1])
   assert(seconds > 2600 && seconds <= 2700, `the reported reset must be honoured, got ${seconds}s`)
   // and routing must now avoid the cooled provider
   const picks = []
   for (let i = 0; i < 4; i++) picks.push(await t.spawn(`z${i}`))
-  assert(picks.every((p) => p === "explore-fast-2" || p === "explore-fast-4"), `routing must avoid the cooled provider, got ${picks.join(",")}`)
+  const usableSlots = SLOTS.map((s, i) => (s.model.startsWith(`${HOT_PROVIDER}/`) ? null : i + 1)).filter(Boolean)
+  assert(picks.every((p) => usableSlots.includes(Number(p.replace(/^[a-z-]+-/, "")))), `routing must avoid the cooled provider, got ${picks.join(",")}`)
   await t.hooks.dispose?.()
 }
 

@@ -135,8 +135,11 @@ the check follows the form that applies to the running project. `context-autoupd
 reports how many map files actually changed on disk, rather than how many it offered
 the cartographer.
 
-`tests/models-snapshot.json` pins the free-cost proof; refresh it with
-`curl -sS https://models.dev/api.json`.
+`tests/models-snapshot.json` pins the free-cost proof. Regenerate it with
+`node tests/refresh-models-snapshot.mjs` after changing `pool-models.json`: it reads
+the current slots, records what each model cost and whether it can call tools, and
+refuses to write anything if a model is not listed on models.dev. Skipping that step
+after a model swap fails `pool-test.mjs` on the model it has never seen.
 
 `pool-models-test.mjs` covers the fourth regression class: the pool's models used to be
 duplicated in `lib/pool.ts` *and* in twelve agent definitions, so changing one meant
