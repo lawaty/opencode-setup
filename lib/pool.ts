@@ -12,13 +12,16 @@ import { fileURLToPath } from "node:url"
 // same model, so `explore-fast-2` and `context-manager-2` are the same model and
 // share one load counter.
 //
-// Every slot carries a `weight` (pool-models.json), and that is the only knob.
-// Routing is one reduce over the slots: lowest ratio wins, ties go to the lighter
-// slot. A slot's ratio is (claims + PRIORITY_MARGIN) / weight, so a heavier slot
-// absorbs proportionally more concurrent work before the pool looks elsewhere.
-// Equal weights make that identical to comparing raw claims, and a weight of 2 over
-// weight 1 reproduces exactly what the old primary/overflow tiers did -- high-weight
-// slots run while the low-weight ones stay free as burst headroom.
+// Every slot carries a `weight` (pool-models.json), and that is the only knob. A
+// slot's weight is a SOFT CEILING on how many claims it holds at once, and priority is
+// simply that weight: the highest-weight slot that is still under its ceiling takes
+// the next spawn, so the pool fills slot 1 to its number before slot 2 sees any work
+// at all. Equal weights therefore give a plain round robin in declaration order, and
+// 2 over 2 / 1 over 1 reproduces the old primary/overflow cycle exactly.
+//
+// Once EVERY slot is at or over its ceiling the weight can no longer gate anything,
+// so the overflow goes to the least loaded slot -- the pool never blocks, and a burst
+// past the summed ceilings degrades to even spreading rather than piling on slot 1.
 //
 // This module holds the state and the decision; plugins/agent-pool.ts owns the
 // hooks (task routing, limit detection, hang reaping) and
@@ -36,13 +39,10 @@ export const CATALOG_TTL_MS = 10 * 60 * 1000
 export const STUCK_MIN_AGE_MS = 5 * 60 * 1000
 export const STUCK_IDLE_MS = 3 * 60 * 1000
 export const HANG_COOLDOWN_MS = 10 * 60 * 1000
-// Claims every slot gets for free, before weight decides anything. This is the
-// head start that keeps low-weight slots empty as headroom: a weight-2 slot is
-// displaced only once it holds PRIORITY_MARGIN claims more than a weight-1 slot
-// at the same load, i.e. the lead the old TIER_MARGIN gave primaries.
-export const PRIORITY_MARGIN = 2
-// A weight above this stops being a preference and becomes a way to silence load
-// balancing, so it is a config error rather than a number to honour.
+// A weight is a count of concurrent sessions, so this bounds both the ceiling and
+// the total pool capacity (4 slots at MAX_WEIGHT each). Past it the number stops
+// describing concurrency and becomes a way to silence load balancing entirely, which
+// is a config error rather than a value to honour.
 export const MAX_WEIGHT = 100
 // opencode.jsonc declares exactly one hidden variant per base per slot, and a pool
 // larger than that would route to agents that do not exist, so the file is capped
@@ -79,7 +79,7 @@ export const CONFIG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..")
 export const MODELS_PATH = join(CONFIG_DIR, MODELS_FILE)
 
 export const FALLBACK_SLOTS: Slot[] = [
-  { index: 1, model: "opencode/space-bunny-free", weight: 2 },
+  { index: 1, model: "opencode/space-bunny-free", weight: 3 },
   { index: 2, model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", weight: 2 },
   { index: 3, model: "opencode/big-pickle", weight: 1 },
   { index: 4, model: "openrouter/thinkingmachines/inkling:free", weight: 1 },
@@ -92,9 +92,10 @@ export type SlotFile = { slots: Slot[]; problems: string[] }
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
 //
-// Weight is preference only, so a bad one warns and falls back to 1 rather than
-// dropping the slot -- losing a model because of a typo in a multiplier would
-// cost real capacity. A slot with no weight at all is weight 1.
+// Weight is the slot's concurrency ceiling, so a bad one warns and falls back to 1
+// rather than dropping the slot -- losing a model because of a typo in a count would
+// cost real capacity. A slot with no weight at all is weight 1, i.e. one session at
+// a time before the next slot is considered.
 export function readSlotFile(path: string = MODELS_PATH): SlotFile {
   const problems: string[] = []
   let parsed: { slots?: unknown }
@@ -126,10 +127,10 @@ export function readSlotFile(path: string = MODELS_PATH): SlotFile {
   return { slots, problems }
 }
 
-// `weight` is how many claims a slot may hold before the pool prefers a lighter
-// one; absent means 1. `tier` is the pre-weight spelling and is accepted as a
-// deprecated alias (primary -> 2, overflow -> 1) so a host that has not been
-// re-deployed keeps its headroom instead of silently flattening to weight 1.
+// `weight` is the soft ceiling on a slot's concurrent claims, and its priority;
+// absent means 1. `tier` is the pre-weight spelling, accepted as a deprecated alias
+// (primary -> 2, overflow -> 1) so a host that has not been re-deployed keeps two
+// slots' worth of headroom instead of silently collapsing to one claim each.
 function readWeight(entry: unknown, at: string, model: string, problems: string[]): number {
   const raw = (entry as { weight?: unknown })?.weight
   if (raw === undefined) {
@@ -404,27 +405,25 @@ export function snapshot(s: State): Snapshot {
 
 const loadOf = (counts: Map<string, number>, model: string) => counts.get(model) ?? 0
 
-// The routing metric: the lowest ratio wins, ties go to the lighter slot. A slot's
-// ratio is how loaded it is relative to how much work it is allowed to hold, so
-// dividing by weight is what makes a heavy slot preferred, while the fixed
-// PRIORITY_MARGIN keeps the first claims of every slot free of weight pressure --
-// that head start is what leaves the light slots as headroom instead of spending
-// them on the first claim. Equal weights reduce to raw load, so an unweighted file
-// routes exactly like a plain least-loaded pool.
-export const loadRatio = (slot: Slot, counts: Map<string, number>) =>
-  (loadOf(counts, slot.model) + PRIORITY_MARGIN) / slot.weight
+// True while the slot still has room under its own ceiling, i.e. while its weight
+// can still gate anything. A cooling slot is never picked regardless of this.
+export const underCeiling = (slot: Slot, counts: Map<string, number>) => loadOf(counts, slot.model) < slot.weight
 
-function outranks(a: Slot, b: Slot, counts: Map<string, number>) {
-  const ra = loadRatio(a, counts)
-  const rb = loadRatio(b, counts)
-  return ra === rb ? a.weight < b.weight : ra < rb
-}
-
+// Priority is the weight itself, NOT load divided by weight. That is the whole point
+// of a weight here: the top slot fills to its ceiling before the next one starts, so
+// a main model gets its 3 concurrent sessions to itself. Weights are dynamic and
+// deliberately unequal, so this never degenerates into a share calculation -- a slot
+// either has room or it does not. Ties (equal weights) keep declaration order, which
+// is what makes equal weights a round robin.
 export function pickSlot(s: State, snap: Snapshot): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
   const pool = usable.length > 0 ? usable : slots
-  return pool.reduce((best, slot) => (outranks(slot, best, snap.counts) ? slot : best), pool[0])
+  const open = pool.filter((slot) => underCeiling(slot, snap.counts))
+  if (open.length > 0) return open.reduce((best, slot) => (slot.weight > best.weight ? slot : best), open[0])
+  // Every slot is at or over its ceiling, so no weight can gate the pick: spread the
+  // overflow over the least loaded slot rather than refusing the work.
+  return pool.reduce((best, slot) => (loadOf(snap.counts, slot.model) < loadOf(snap.counts, best.model) ? slot : best), pool[0])
 }
 
 export function agentFor(base: string, slot: number) {

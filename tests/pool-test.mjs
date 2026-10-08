@@ -16,24 +16,20 @@ const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
 const SLOT_MODELS = SHIPPED.map((s) => s.model)
 // pool-models.json's weight is the only routing knob, so the tests talk about the
-// heaviest slots and the lightest slots rather than a tier name the file no longer
+// heaviest slot and the lightest slots rather than a tier name the file no longer
 // carries. Which slots those are is the file's business.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const MIN_WEIGHT = Math.min(...SHIPPED.map((s) => s.weight))
 const HEAVY_MODELS = SHIPPED.filter((s) => s.weight === MAX_WEIGHT).map((s) => s.model)
 const LIGHT_MODELS = SHIPPED.filter((s) => s.weight === MIN_WEIGHT).map((s) => s.model)
+// The summed ceilings are where the weighted phase ends and overflow begins, so the
+// depth needed to see both is derived rather than guessed.
+const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
 
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
 const pool = await import(join(HERE, "..", "lib", "pool.ts"))
 const { AgentPool } = await import(PLUGIN)
-
-// How many claims the heaviest slot holds before a lightest slot is first engaged.
-// The ratio rule hands over when (claims + PRIORITY_MARGIN)/weight stops being lowest,
-// and a lightest slot still sitting at zero offers PRIORITY_MARGIN / MIN_WEIGHT -- so
-// the handover is at MAX_WEIGHT * PRIORITY_MARGIN / MIN_WEIGHT - PRIORITY_MARGIN claims.
-// Derived, because how far a slot leads is weight arithmetic and not a literal.
-const ENGAGE_AT = Math.floor((MAX_WEIGHT * pool.PRIORITY_MARGIN) / MIN_WEIGHT) - pool.PRIORITY_MARGIN
 
 const assert = (cond, msg) => {
   if (!cond) {
@@ -60,17 +56,24 @@ const make = async (id, dir) => {
 const dir1 = mkdtempSync(join(tmpdir(), "agent-pool-solo-"))
 const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 
-// 1. routing: the heaviest slot is loaded before a lighter slot engages, and once
-//    ENGAGE_AT claims are on it the lightest slots take over. The exact interleave
-//    depends on slot count and weight, so what is pinned here is the property, not a
-//    literal sequence -- slot numbers, weights and pick order are pool-models.json's
-//    business.
+// 1. routing: priority IS the weight, and it is a soft ceiling. The heaviest slot
+//    fills to its own weight before the next slot sees any work, slots fill in weight
+//    order, and only past the summed ceilings does the overflow spread evenly. Slot
+//    numbers, weights and pick order are pool-models.json's business, so what is
+//    pinned here is the property, not a literal sequence.
 const a = await make("solo", dir1)
 const calls = []
-// Deep enough for the lightest slot to engage and then for every slot to be used at
-// least once, whatever the shipped weights are.
-const CONCURRENCY = Math.max(SLOT_MODELS.length * 4, (ENGAGE_AT + 1) * 2)
+// Deep enough to exhaust every ceiling and then overflow, whatever the shipped
+// weights are.
+const CONCURRENCY = CAPACITY + SLOT_MODELS.length
 for (let i = 1; i <= CONCURRENCY; i++) calls.push(await a.spawn(`c${i}`, "explore-fast"))
+// A release only means anything on a live claim, and the tests below release claims out
+// of the middle of that run, so track which spawns still hold one.
+const live = new Set(calls.map((_, i) => `c${i + 1}`))
+const releaseCall = async (callID) => {
+  await a.finish(callID)
+  live.delete(callID)
+}
 const slotNum = (variant) => Number(/-(\d+)$/.exec(variant)[1])
 const numbers = calls.map(slotNum)
 assert(
@@ -81,43 +84,55 @@ assert(
   new Set(numbers).size === SLOT_MODELS.length,
   `all ${SLOT_MODELS.length} slots must be used under ${CONCURRENCY} concurrent, got ${seq(calls)}`,
 )
-// nothing lighter than the heaviest slots is touched until the heaviest is ENGAGE_AT
-// deep, and after that the lightest slots fill evenly among themselves
-const heavyPicks = numbers.slice(0, ENGAGE_AT)
-assert(
-  heavyPicks.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
-  `the first ${ENGAGE_AT} spawns must be the heaviest slots, got ${seq(calls)}`,
-)
-const lightPicks = numbers.slice(ENGAGE_AT)
+// within the weighted phase, no slot is used before every heavier slot is at its own
+// ceiling: the heaviest slot gets its sessions entirely to itself first
 const countsByModel = (ns) => {
   const m = new Map()
   for (const n of ns) m.set(SLOT_MODELS[n - 1], (m.get(SLOT_MODELS[n - 1]) ?? 0) + 1)
   return m
 }
-const lightTally = countsByModel(lightPicks)
+for (let i = 0; i < CAPACITY; i++) {
+  const sofar = countsByModel(numbers.slice(0, i))
+  const topWeight = Math.max(...SHIPPED.filter((x) => (sofar.get(x.model) ?? 0) < x.weight).map((x) => x.weight))
+  assert(
+    SHIPPED[numbers[i] - 1].weight === topWeight,
+    `spawn ${i + 1} must go to the heaviest slot with room (weight ${topWeight}), got ${SLOT_MODELS[numbers[i] - 1]}`,
+  )
+}
+// and the heaviest slot really does run alone to its ceiling before slot 2 starts
+const heavyLead = numbers.slice(0, MAX_WEIGHT)
 assert(
-  Math.max(...LIGHT_MODELS.map((m) => lightTally.get(m) ?? 0)) - Math.min(...LIGHT_MODELS.map((m) => lightTally.get(m) ?? 0)) <= 1,
-  `the lightest slots must fill evenly once engaged, got ${seq(calls)}`,
+  heavyLead.every((n) => HEAVY_MODELS.includes(SLOT_MODELS[n - 1])),
+  `the first ${MAX_WEIGHT} spawns must all be the heaviest slot, got ${seq(calls)}`,
 )
-// the point of the shipped weights: the heaviest slot outranks the lighter ones put
-// together, so its provider carries the larger share of the work
-const allTally = countsByModel(numbers)
-const shareOf = (models) => models.reduce((sum, m) => sum + (allTally.get(m) ?? 0), 0)
 assert(
-  shareOf(HEAVY_MODELS) > shareOf(LIGHT_MODELS),
-  `the heaviest slot must take the larger share, got ${shareOf(HEAVY_MODELS)} heavy vs ${shareOf(LIGHT_MODELS)} light: ${seq(calls)}`,
+  (countsByModel(heavyLead).get(HEAVY_MODELS[0]) ?? 0) === MAX_WEIGHT,
+  `the heaviest slot must reach exactly its ceiling of ${MAX_WEIGHT}, got ${seq(calls)}`,
+)
+// past every ceiling the overflow equalises instead of piling on slot 1, so the totals
+// converge even though the ceilings do not
+const finalTally = countsByModel(numbers)
+const finalLoads = SLOT_MODELS.map((m) => finalTally.get(m) ?? 0)
+assert(
+  Math.max(...finalLoads) - Math.min(...finalLoads) <= 1,
+  `overflow must equalise the totals once every slot is at its ceiling, got ${finalLoads.join("/")} from ${seq(calls)}`,
+)
+assert(
+  finalLoads.reduce((x, y) => x + y, 0) === CONCURRENCY,
+  `every spawn must be accounted for, got ${seq(calls)}`,
 )
 
-// 2. releasing a claim returns routing to the freed slot's weight, since that slot
-//    is the least loaded again. Read the weight off the released claim rather than
-//    assuming a particular slot number is the heavy one.
-const freedSlot = slotNum(calls[2]) // the slot c3 claimed
-const freedModel = SLOT_MODELS[freedSlot - 1]
-await a.finish("c3")
+// 2. releasing a claim on the heaviest slot hands routing straight back to it: it drops
+//    under its ceiling again and, being the heaviest, outranks everything else. So the
+//    pool refills what it freed rather than carrying on down the priority order. The
+//    slot is read off the run rather than assumed to be a particular number.
+const heaviestSlot = slotNum(calls[0])
+const heaviestCall = calls.map((v, i) => [slotNum(v), `c${i + 1}`]).filter(([n, id]) => n === heaviestSlot && live.has(id)).pop()[1]
+await releaseCall(heaviestCall)
 const afterRelease = slotNum(await a.spawn("r1", "explore-fast"))
 assert(
-  SLOT_MODELS[afterRelease - 1] === freedModel,
-  `a freed ${SHIPPED[freedSlot - 1].weight}-weight claim should be filled again first, got ${SLOT_MODELS[afterRelease - 1]} instead of ${freedModel}`,
+  afterRelease === heaviestSlot,
+  `releasing a claim on slot ${heaviestSlot} (weight ${SHIPPED[heaviestSlot - 1].weight}) must hand routing back to it, got slot ${afterRelease}`,
 )
 
 // 3. releasing the busiest claim hands that slot the next spawn: the pool refills
@@ -132,19 +147,23 @@ const loads = async () => {
   return m
 }
 const byLoad = await loads()
-const busiest = SLOT_MODELS.reduce((best, model) => (byLoad.get(model) > byLoad.get(best) ? model : best), SLOT_MODELS[0])
-const busiestCall = calls.map((v, i) => [v, i]).filter(([v]) => SLOT_MODELS[slotNum(v) - 1] === busiest).pop()
-await a.finish(`c${busiestCall[1] + 1}`)
+const busiestSlot = SLOT_MODELS.findIndex((model) => byLoad.get(model) === Math.max(...byLoad.values())) + 1
+const busiestCall = calls
+  .map((v, i) => [slotNum(v), `c${i + 1}`])
+  .filter(([n, id]) => n === busiestSlot && live.has(id))
+  .pop()[1]
+await releaseCall(busiestCall)
 const afterFree = slotNum(await a.spawn("r2", "explore-fast"))
 assert(
-  SLOT_MODELS[afterFree - 1] === busiest,
-  `the slot whose claim was released should be filled first, got slot ${afterFree} instead of the freed ${busiest}`,
+  afterFree === busiestSlot,
+  `the slot whose claim was released should be refilled first, got slot ${afterFree} instead of the freed ${busiestSlot}`,
 )
 const back = [await a.spawn("r3", "explore-fast"), await a.spawn("r4", "explore-fast"), await a.spawn("r5", "explore-fast")]
 assert(
   back.every((v) => new RegExp(`^explore-fast-[1-${SLOT_MODELS.length}]$`).test(v)),
   `released slots must still route, got ${back.join(",")}`,
 )
+for (const v of ["r3", "r4", "r5"]) live.add(v)
 
 // 4. pool_status reports global load, models, weights, per-process breakdown
 const statusOut = await a.status()

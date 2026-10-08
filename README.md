@@ -16,21 +16,16 @@ agent, so `explore-fast-2` and `context-manager-2` are the same model sharing on
 counter. Four is the cap: `opencode.jsonc` declares one hidden variant per base per slot,
 and `pool-models.json` entries past the fourth are dropped with a warning.
 
-| slot | model | provider | context | weight |
+| slot | model | provider | context | weight (ceiling) |
 |---|---|---|---|---|
-| 1 | `longcat-2.5-preview-free` | opencode-go | 1M | 4 |
-| 2 | `space-bunny-free` | Zen | 1M | 1 |
-| 3 | `longcat-2.5-preview-free` | Zen | 1M | 1 |
-| 4 | `big-pickle` | Zen | 200k | 1 |
+| 1 | `longcat-2.5-preview-free` | opencode-go | 1M | 3 |
+| 2 | `big-pickle` | Zen | 200k | 2 |
+| 3 | `space-bunny-free` | Zen | 1M | 1 |
+| 4 | `longcat-2.5-preview-free` | Zen | 1M | 1 |
 
-All four are free (verified 0/0 cost against models.dev).
-
-Two providers, weighted on purpose: **opencode-go takes ~58% of the work, Zen ~43%**. Weight
-is per *slot*, and a slot is compared against every other slot, so a single opencode-go slot
-needs weight 4 to outweigh three Zen slots — that is the whole reason the Zen slots are flat
-at 1. The trade is deliberate and asymmetric: a provider-wide limit on Zen costs 43% of
-routing, on opencode-go 58%. Neither stops the pool; cooldowns reroute the rest to whatever is
-still available. Weight 3 on the go slot is the 50/50 split if the split should be even.
+All four are free (verified 0/0 cost against models.dev). Weight is **a ceiling on how many
+sessions one model runs at once**, not a share of the work, so the list is ordered by
+preference and the bottom is reserve.
 
 Slot 1 runs LongCat with **thinking disabled**, set in `opencode.jsonc` under
 `provider.opencode-go.models`. Long thinking is its only demonstrated failure
@@ -48,39 +43,29 @@ unpooled — they are deliberate, costly, and shouldn't compete for free-tier ca
 
 ### Routing
 
-Load is counted **per model across all agent types**, so total pressure stays balanced.
-Each slot's `weight` in `pool-models.json` is the only knob that decides the share of
-work. Routing is one pass over the slots: **lowest ratio wins, ties go to the lighter
-slot.**
+Load is counted **per model across all agent types**, so total pressure stays balanced. A
+slot's `weight` in `pool-models.json` is a **soft ceiling on concurrent sessions, and that
+same number is the priority**. The rule is two lines:
+
+1. **the highest-weight slot still under its ceiling takes the spawn** — so slot 1 fills to
+   its number before slot 2 sees any work at all
+2. **once every slot is at its ceiling, the overflow goes to the least loaded slot**
 
 ```
-load ratio = (in-flight claims + 2) / weight
+1,1,1, 2,2, 3, 4, ...      weights 3,2,1,1
 ```
 
-`pool_status` prints that ratio per slot, so the pick is readable without running
-anything: the slot marked `<- next` is the one the next spawn takes.
+The main model gets its 3 sessions to itself, then big-pickle takes 2, then space-bunny and
+Zen longcat take 1 each — no model is asked to multiplex past its ceiling while another sits
+idle, which is what keeps per-session latency sane on a small free model.
 
-- weight `1` fills evenly with its peers; nothing is held back
-- weight `2` is the usual workhorse: the pool moves on once it holds 2 claims more than a
-  weight-1 slot, so the light slots stay empty as **headroom** for a burst
-- weight `3`+ leans harder on a model you trust more; the per-slot share approaches
-  the weight ratio once the pool is busy (3 vs 1 settles at roughly 3:1)
-- weight `0.5` deprioritises a slot without removing it from the pool
+The ceiling is soft on purpose: past the summed ceilings (7 here) the overflow equalises, so
+a burst degrades to even spreading instead of piling onto slot 1 or blocking. Equal weights
+give a plain round robin in list order, and `2,2,1,1` reproduces the old primary/overflow
+cycle exactly — which is why the retired `tier` values still work as an alias.
 
-The `+2` is a free head start for every slot; without it the first claim would land on
-each slot in turn and nothing would ever be held in reserve. Ties go to the *lighter* slot
-so a heavy one gets exactly its weight and not one claim more.
-
-With the shipped weights the opencode-go slot soaks up bursts on its own and the Zen slots
-fill in only once it is 6 ahead — 6 concurrent → `6/0/0/0`, 12 → `9/1/1/1`, and by 16 it
-settles at the ~58/43 split:
-
-```
-1,1,1,1,1,1,2,3,4,1,1,1,1,2,3,4
-```
-
-Before the go slot was weighted, the same weights read `1,2,1,2,3,4,1,2,…` with 6 concurrent
-→ `2/2/1/1` — the old primary/overflow cycle, which is what weight 2 over weight 1 still gives.
+`pool_status` shows each slot as `load=3/3 FULL` with `<- next` on the slot the next spawn
+would take, so the priority order is readable without running anything.
 
 Two agents reach the pool differently, and both share one state:
 
@@ -223,22 +208,24 @@ owns the list, the config hook derives everything else from it, and the tests fa
 
 ## Inspecting it at runtime
 
-`pool_status` reports live load per model and per agent type, each slot's weight and load
-ratio, which slot the next spawn would take, cooldowns with remaining seconds, and a
-per-process breakdown:
+`pool_status` reports live load per model and per agent type, each slot's load against its
+weight ceiling, which slot the next spawn would take, cooldowns with remaining seconds, and
+a per-process breakdown:
 
 ```
 shared pool over 4 free models from pool-models.json; bases: explore-fast, implement-fast, context-manager
 lowest load ratio wins, ties to the lighter slot: ratio = (claims + 2) / weight
-slot 1 w4  opencode-go/longcat-2.5-preview-free  load=2  ratio=1.00 <- next  [explore-fastx1 context-managerx1]
-slot 2 w1  opencode/space-bunny-free  load=1  ratio=3.00  [implement-fastx1]
-slot 3 w1  opencode/big-pickle  load=0  ratio=2.00  [idle]
+priority is weight: the heaviest slot under its ceiling takes the next spawn
+slot 1 w3  opencode-go/longcat-2.5-preview-free  load=2/3  [explore-fastx1 context-managerx1]
+slot 2 w2  opencode/big-pickle  load=0/2  [idle]
+slot 3 w1  opencode/space-bunny-free  load=1/1 FULL  [implement-fastx1]
+slot 4 w1  opencode/longcat-2.5-preview-free  load=0/1  [idle]
 
 watchdog alive: last sweep 4s ago (every 30s).
 ```
 
-`ratio` is the routing metric, so the slots that will actually be used next are the ones
-with the lowest ratio, not the emptiest ones. `watchdog alive` is
+`load=n/weight` is the ceiling and its state: `FULL` means the slot is at its number and is
+only used again once every other slot is too. `<- next` is where the next spawn goes. `watchdog alive` is
 the cheap way to confirm the reaper is actually running
 without waiting for a hang — the reaper logs nothing when it finds nothing, so a silent
 log is not evidence of a dead timer. Each process also logs one `reaper armed` line at

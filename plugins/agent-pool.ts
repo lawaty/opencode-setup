@@ -257,8 +257,8 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
             slot: slot.index,
             weight: slot.weight,
             model: slot.model,
+            ceiling: slot.weight,
             load: (snap.counts.get(slot.model) ?? 0) + 1,
-            ratio: Number(pool.loadRatio(slot, snap.counts).toFixed(2)),
           })
           return
         }
@@ -282,7 +282,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
     tool: {
       pool_status: tool({
         description:
-          "Show live pool load across every opencode process, per free model and per agent type, each slot's weight and load ratio (lowest ratio wins, ties to the lighter slot, and the slot marked <- next is what the next spawn takes), and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
+          "Show live pool load across every opencode process, per free model and per agent type, each slot's load against its weight ceiling, the slot marked <- next that the next spawn would take, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
         args: {},
         async execute() {
           pool.refreshCatalog(s, serverUrl)
@@ -312,7 +312,11 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
             const marker = slot.index === next.index ? " <- next" : ""
-            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${entry?.total ?? 0}  ratio=${pool.loadRatio(slot, snap.counts).toFixed(2)}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
+            // claims/weight: the ceiling is reached at the denominator, and a slot at
+            // its ceiling is only used again once every other slot is also there.
+            const load = entry?.total ?? 0
+            const atCeiling = !pool.underCeiling(slot, snap.counts)
+            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${load}/${slot.weight}${atCeiling ? " FULL" : ""}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
           }
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
@@ -322,7 +326,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} free models from ${pool.MODELS_FILE}; bases: ${pool.BASES.join(", ")}\nlowest load ratio wins, ties to the lighter slot: ratio = (claims + ${pool.PRIORITY_MARGIN}) / weight`,
+              `shared pool over ${slots.length} free models from ${pool.MODELS_FILE}; bases: ${pool.BASES.join(", ")}\npriority is weight: the heaviest slot under its ceiling takes the next spawn (FULL = at ceiling, used only when every slot is)`,
               ...slots.map(line),
               "",
               "by process:",

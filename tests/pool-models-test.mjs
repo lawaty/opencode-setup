@@ -12,9 +12,9 @@
 //      instead of a pool that cannot route
 //   5. slot count is data, not code: three slots route 1,2,3 and the fourth agent
 //      name is simply absent
-//   6. weight is what decides the share of work: the heavier slot is picked
-//      roughly `weight` times as often, a bad weight warns and keeps the slot, and
-//      the pre-weight `tier` spelling still maps to the weight it used to imply
+//   6. weight is a ceiling and a priority: the heaviest slot fills to its own weight
+//      before the next slot starts, a bad weight warns and keeps the slot, and the
+//      pre-weight `tier` spelling still maps to the weight it used to imply
 //   7. the pool is capped at pool.MAX_SLOTS, because opencode.jsonc declares one
 //      variant per base per slot and a bigger pool would route to nothing
 
@@ -173,23 +173,39 @@ for (const base of BASES) {
   assert(broken.cfg.agent[`${base}-3`].model === GOOD_3, `slot 3 must run the third valid entry, got ${broken.cfg.agent[`${base}-3`].model}`)
 }
 
-// 7. weight decides the share of work. Two slots on one tier-free pool, so the only
-//    thing that can separate them is the weight: a 3 vs 1 pair settles at roughly
-//    three claims on the heavy slot for every one on the light one. Measured by
-//    spawns, because the claim files pool_status reads are exactly those spawns.
+// 7. weight is a ceiling AND a priority. The heaviest slot must take all of its own
+//    spawns before the lighter one sees any, then both overflow evenly -- which is what
+//    a main model "3 sessions to itself" means. Measured by spawns, because the claim
+//    files pool_status reads are exactly those spawns.
 const HEAVY = `${PROV_A}/fixture-weight-heavy`
 const LIGHT = `${PROV_B}/fixture-weight-light`
 const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, weight: 3 }, { model: LIGHT, weight: 1 }] }), "weighted")
+const HEAVY_CEILING = 3
 const tally = { [HEAVY]: 0, [LIGHT]: 0 }
-const ROUNDS = 80
-for (let i = 0; i < ROUNDS; i++) {
-  const slot = (await weighted.spawn(`w${i}`)).replace("explore-fast-", "")
+const tallyPick = async (callID) => {
+  const slot = (await weighted.spawn(callID)).replace("explore-fast-", "")
   tally[slot === "1" ? HEAVY : LIGHT]++
+  return slot
 }
-const share = tally[HEAVY] / ROUNDS
+for (let i = 0; i < HEAVY_CEILING; i++) {
+  const slot = await tallyPick(`w${i}`)
+  assert(slot === "1", `spawn ${i + 1} must go to the weight-3 slot before the weight-1 slot is touched, got slot ${slot}`)
+}
+// the ceiling is a ceiling: the heavy slot holds no more than its weight until the
+// light one has caught up
+const SPILL = 3
+for (let i = HEAVY_CEILING; i < HEAVY_CEILING + SPILL; i++) {
+  await tallyPick(`w${i}`)
+  assert(
+    tally[HEAVY] <= HEAVY_CEILING + 1,
+    `the weight-3 slot must stop at its ceiling while the weight-1 slot has room, got ${tally[HEAVY]}/${HEAVY_CEILING} vs ${tally[LIGHT]}`,
+  )
+}
+// past every ceiling the overflow equalises rather than piling on the heavy slot
+const heavyShare = tally[HEAVY] / (HEAVY_CEILING + SPILL)
 assert(
-  share > 0.6 && share < 0.9,
-  `a weight-3 slot should take roughly three quarters of the spawns, got ${tally[HEAVY]}/${ROUNDS} on ${HEAVY} and ${tally[LIGHT]}/${ROUNDS} on ${LIGHT}`,
+  heavyShare < 0.8 && heavyShare > 0.3,
+  `the overflow must spread rather than pile on the heavy slot, got ${tally[HEAVY]} heavy vs ${tally[LIGHT]} light`,
 )
 // and the config hook reports the weights it bound, so a typo is visible in the log
 assert(

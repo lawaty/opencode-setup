@@ -95,9 +95,16 @@ const dirB = scratch()
   const after = []
   for (let i = 0; i < 6; i++) after.push(await a.spawn(`a${i + 2}`))
   assert(!after.includes(baseline), `cooled heaviest slot must be skipped, got ${after.join(",")}`)
-  // another slot of the same weight must still take work
-  const spare = SLOTS.filter((s) => s.weight === slot.weight && s.model !== slot.model)
-  if (spare.length > 0) assert(after.includes(variantOf(spare[0])), `${variantOf(spare[0])} must still take work`)
+  // a cooled slot leaves the candidate set entirely, so the very next spawn must land
+  // on the heaviest slot that is left. Checking every pick would be wrong: once the
+  // remaining ceilings fill, the overflow reaches the light slots by design.
+  const remaining = SLOTS.filter((s) => s.model !== slot.model)
+  const topRemaining = Math.max(...remaining.map((s) => s.weight))
+  const first = SLOTS[Number(/-(\d+)$/.exec(after[0])[1]) - 1]
+  assert(
+    first.weight === topRemaining,
+    `the first spawn after a cooldown must go to a heaviest remaining slot (weight ${topRemaining}), got ${after[0]} (weight ${first.weight})`,
+  )
   assert(/COOLING/.test(await a.status()), "status must flag the cooling model")
   assert(new RegExp(`cooling: ${escape(slot.model)}\\b`).test(await a.status()), "status must name the cooling model")
 }

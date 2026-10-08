@@ -57,8 +57,8 @@ const BASES = ["explore-fast", "implement-fast", "context-manager"]
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
 // Slot numbers per weight, so these checks hold whatever weights and order
-// pool-models.json lists its slots in. pickSlot compares load ratio, not
-// position: what "a reserved slot" and "a workhorse slot" mean is the file's.
+// pool-models.json lists its slots in. pickSlot compares weights, not
+// position: what "a workhorse slot" and "a reserve slot" mean is the file's.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const slotsOfWeight = (weight) => SHIPPED.flatMap((s, i) => (s.weight === weight ? [i + 1] : []))
 const HEAVY_SLOTS = slotsOfWeight(MAX_WEIGHT)
@@ -68,7 +68,8 @@ const firstOf = (xs) => xs[0]
 // How deep the heaviest slot goes before a lightest one is engaged, derived from the
 // ratio rule rather than written as a literal: handover happens at
 // weight * PRIORITY_MARGIN / weight - PRIORITY_MARGIN claims.
-const ENGAGE_AT = Math.floor((MAX_WEIGHT * pool.PRIORITY_MARGIN) / Math.min(...SHIPPED.map((s) => s.weight))) - pool.PRIORITY_MARGIN
+// The summed ceilings are where the weighted phase ends and the overflow begins.
+const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
 
 // 1. slot N is the same model for every base, so the pool is genuinely shared
 {
@@ -120,7 +121,7 @@ const ENGAGE_AT = Math.floor((MAX_WEIGHT * pool.PRIORITY_MARGIN) / Math.min(...S
 //    implement-fast onto the same shared slots instead of its own
 {
   const t = await mk("shared-2", scratch())
-  for (let i = 0; i < ENGAGE_AT; i++) await t.spawn(`x${i}`, "explore-fast") // deep enough to engage a lighter slot
+  for (let i = 0; i < CAPACITY; i++) await t.spawn(`x${i}`, "explore-fast") // deep enough to exhaust every ceiling
   const afterExplore = slotOf(await t.spawn("x4", "implement-fast"))
   assert(
     afterExplore === firstOf(LIGHT_SLOTS),

@@ -8,7 +8,7 @@ and how the pieces are distributed.
 
 | Path | Role |
 |---|---|
-| `pool-models.json` | the pool's models and weights — the only file to edit to swap a model or change its share of the work |
+| `pool-models.json` | the pool's models and weights — the only file to edit to swap a model or change how many sessions it runs |
 | `opencode.jsonc` | 19 agents (3 pooled bases + 12 hidden variants + 4 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
 | `lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
 | `lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
@@ -43,10 +43,10 @@ Edit `pool-models.json` — one entry per slot, array position is the slot numbe
 
 ```json
 { "slots": [
-  { "model": "opencode-go/longcat-2.5-preview-free", "weight": 4 },
+  { "model": "opencode-go/longcat-2.5-preview-free", "weight": 3 },
+  { "model": "opencode/big-pickle", "weight": 2 },
   { "model": "opencode/space-bunny-free", "weight": 1 },
-  { "model": "opencode/longcat-2.5-preview-free", "weight": 1 },
-  { "model": "opencode/big-pickle", "weight": 1 }
+  { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
 ] }
 ```
 
@@ -54,19 +54,24 @@ At most **4 slots**: `opencode.jsonc` declares one hidden variant per base per s
 fifth entry would route spawns at an agent that does not exist. Entries past the fourth are
 dropped with a warning, not silently ignored.
 
-`weight` is the share knob, and it is **per slot, not per provider**: a slot is compared
-against every other slot, so making one provider's model run more often than another's means
-weighting it against each competing slot — the opencode-go slot carries weight 4 against
-three Zen slots at 1, which measures ~58% opencode-go / ~43% Zen. Weight 3 there is an even
-split. Routing is one pass over the slots: **lowest ratio wins, ties go to the lighter slot**,
-where `ratio = (in-flight claims + 2) / weight` — so a slot may hold roughly `weight` times
-the claims of a lighter one before the pool looks elsewhere. `weight: 2` over `weight: 1` is the usual shape —
-the heavy slots do the work and the light ones stay empty as burst headroom. Raise a weight
-to lean on a model you trust more (the per-slot share approaches the weight ratio once the
-pool is busy), lower it toward `0.5` to deprioritise one without removing it. No weight means
-`1`; anything that is not a number in `(0, 100]` warns and means `1`. The old `tier` key is
-still read as a deprecated alias — `primary` is weight 2, `overflow` is weight 1 — with a
-warning, so a host that has not picked up this file keeps its headroom.
+`weight` is a **soft ceiling on how many concurrent sessions one slot runs**, and that same
+number is its priority. Two rules, in order:
+
+1. the **highest-weight slot still under its ceiling** takes the spawn, so the main model
+   gets its 3 sessions to itself before slot 2 sees any work
+2. once **every** slot is at its ceiling, the overflow goes to the least loaded slot, so a
+   burst past the summed ceilings equalises instead of piling up or blocking
+
+So `3,2,1,1` produces `1,1,1,2,2,3,4,…` — ordered preference, with the bottom of the list as
+reserve. Weights are dynamic and deliberately unequal, so this is never a share calculation:
+a slot either has room under its ceiling or it does not. Equal weights give a round robin in
+list order, and `2,2,1,1` reproduces the old primary/overflow cycle exactly.
+
+Raise a weight to let a model run more sessions at once, lower it to make it more of a
+reserve. No weight means `1`; anything that is not a number in `(0, 100]` warns and means `1`.
+The old `tier` key is still read as a deprecated alias — `primary` is weight 2, `overflow` is
+weight 1 — with a warning, so a host that has not picked up this file keeps two slots' worth
+of headroom.
 
 Do **not** also edit the variant agents in `opencode.jsonc` — they carry no `model` on
 purpose. The plugin's config hook writes `<base>-<slot>` for `explore-fast`,
@@ -80,7 +85,7 @@ capable — check with `curl -sS https://models.dev/api.json` or `opencode model
 
 ```bash
 opencode debug agent explore-fast-1   # model it resolved
-opencode run "pool_status"            # slots, weight, load ratio, cooldowns
+opencode run "pool_status"            # slots, load/weight, ceilings, cooldowns
 ```
 
 Failure modes are logged, never silent: a bad entry (no `provider/model-id`, a repeated
@@ -258,10 +263,10 @@ in `~/.local/share/opencode/` where it is.
 ## Troubleshooting
 
 **A pooled spawn went to an unexpected model.** Read the `routed` log line for the `slot=`,
-`weight=` and `ratio=` fields, then check for a `limit.<provider>__<model>.json` file — a
+`weight=` and `ceiling=` fields, then check for a `limit.<provider>__<model>.json` file — a
 stale one with a future `until` will keep diverting work. If the model is right but the slot
-is not the emptiest one, that is the weight: routing compares `(claims + 2) / weight`, not
-raw load.
+is not the one you expected, that is the weight: routing takes the heaviest slot still under
+its ceiling, not the emptiest one.
 
 **Everything routes to one provider.** Check for `limit.*.json` files cooling the other.
 A provider-wide `free_tier_limit` cools every slot on that provider at once, which is
