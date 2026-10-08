@@ -2,10 +2,10 @@ import { tool, type Plugin, type PluginOptions } from "@opencode-ai/plugin"
 import * as pool from "../lib/pool.ts"
 
 // Routes any pooled agent type (explore-fast, implement-fast, context-manager)
-// onto a shared set of four free models, and keeps the pool off models that are
+// onto a shared set of free models, and keeps the pool off models that are
 // known to be unusable right now.
 //
-// The four models are not written here. They live in pool-models.json, and the
+// The pool's models are not written here. They live in pool-models.json, and the
 // config hook rewrites the variant agents (explore-fast-N, ...) and the provider
 // whitelists in opencode.jsonc from that file, so changing the pool is a one-file
 // edit instead of editing twelve agent definitions. The models in opencode.jsonc
@@ -145,7 +145,11 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
         // opencode deletes every model a provider offers that is not whitelisted,
         // so a slot whose model is missing from the whitelist silently resolves to
         // no model at all. Add it instead of making the user edit a second file.
-        const [provider, id] = slot.model.split("/")
+        // Split on the first slash only: some providers (openrouter) put a vendor
+        // segment in the model id itself, e.g. openrouter/nvidia/nemotron-3-ultra:free.
+        const slash = slot.model.indexOf("/")
+        const provider = slot.model.slice(0, slash)
+        const id = slot.model.slice(slash + 1)
         const entry = providers?.[provider]
         if (!entry) {
           await warnOnce(`provider ${provider} is not configured in opencode.jsonc; slot ${slot.index} (${slot.model}) cannot resolve`)
@@ -160,7 +164,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
       s.known = known
       await log(
         "info",
-        `pool-models.json: bound ${known.size} variant agent(s) to ${slots.length} slot(s): ${slots.map((sl) => `${sl.index}=${sl.model} ${sl.tier}`).join(", ")}`,
+        `pool-models.json: bound ${known.size} variant agent(s) to ${slots.length} slot(s): ${slots.map((sl) => `${sl.index}=${sl.model} w${sl.weight}`).join(", ")}`,
       )
     },
 
@@ -251,9 +255,10 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
           output.args.subagent_type = variant
           await log("info", `routed ${requested} -> ${variant}`, {
             slot: slot.index,
-            tier: slot.tier,
+            weight: slot.weight,
             model: slot.model,
             load: (snap.counts.get(slot.model) ?? 0) + 1,
+            ratio: Number(pool.loadRatio(slot, snap.counts).toFixed(2)),
           })
           return
         }
@@ -277,7 +282,7 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
     tool: {
       pool_status: tool({
         description:
-          "Show live pool load across every opencode process, per free model and per agent type, the primary/overflow tier split, and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
+          "Show live pool load across every opencode process, per free model and per agent type, each slot's weight and load ratio (lowest ratio wins, ties to the lighter slot, and the slot marked <- next is what the next spawn takes), and which models are cooling after a rate limit or a stuck task. Check it before launching many parallel subagents.",
         args: {},
         async execute() {
           pool.refreshCatalog(s, serverUrl)
@@ -294,6 +299,9 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
           for (const claim of snap.own.values()) add(claim.m, claim.v)
           for (const sibling of snap.siblings) for (const claim of sibling.claims) add(claim.m, claim.v)
 
+          // Which slot the next pooled spawn would actually take, so a surprising routing
+          // decision can be read off the status instead of guessed at from load alone.
+          const next = pool.pickSlot(s, snap)
           const line = (slot: pool.Slot) => {
             const entry = byModel.get(slot.model)
             const users = entry && entry.bases.size > 0 ? [...entry.bases].map(([b, n]) => `${b}x${n}`).join(" ") : "idle"
@@ -303,7 +311,8 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
               strike ? `COOLING ${Math.ceil((strike.until - now) / 1000)}s (${strike.reason}, strike ${strike.strikes})` : "",
               status && status !== "active" && status !== "unknown" ? `catalog:${status}` : "",
             ].filter(Boolean)
-            return `  slot ${slot.index} ${slot.tier.padEnd(8)} ${slot.model}  load=${entry?.total ?? 0}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
+            const marker = slot.index === next.index ? " <- next" : ""
+            return `  slot ${slot.index} w${slot.weight}  ${slot.model}  load=${entry?.total ?? 0}  ratio=${pool.loadRatio(slot, snap.counts).toFixed(2)}${marker}  [${users}${notes.length ? "; " + notes.join("; ") : ""}]`
           }
 
           const total = [...snap.counts.values()].reduce((sum, n) => sum + n, 0)
@@ -313,9 +322,8 @@ export const AgentPool = (async ({ client, serverUrl }, options?: PluginOptions)
           return {
             title: `agent-pool: ${total} task(s) in flight, ${coolingNow.length} model(s) cooling`,
             output: [
-              `shared pool over ${slots.length} free models from ${pool.MODELS_FILE}; bases: ${pool.BASES.join(", ")}`,
-              ...slots.filter((sl) => sl.tier === "primary").map(line),
-              ...slots.filter((sl) => sl.tier === "overflow").map(line),
+              `shared pool over ${slots.length} free models from ${pool.MODELS_FILE}; bases: ${pool.BASES.join(", ")}\nlowest load ratio wins, ties to the lighter slot: ratio = (claims + ${pool.PRIORITY_MARGIN}) / weight`,
+              ...slots.map(line),
               "",
               "by process:",
               `  ${s.id} (this process): ${snap.own.size} claim(s)`,

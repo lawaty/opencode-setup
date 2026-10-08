@@ -56,13 +56,19 @@ const BASES = ["explore-fast", "implement-fast", "context-manager"]
 // A spawn the pool could not rewrite (because opencode.jsonc declares no variant
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
-// Slot numbers per tier, so these checks hold whatever order pool-models.json
-// lists its slots in. pickSlot filters by tier, not position.
-const slotsOfTier = (tier) => SHIPPED.flatMap((s, i) => (s.tier === tier ? [i + 1] : []))
-const PRIMARY_SLOTS = slotsOfTier("primary")
-const OVERFLOW_SLOTS = slotsOfTier("overflow")
+// Slot numbers per weight, so these checks hold whatever weights and order
+// pool-models.json lists its slots in. pickSlot compares load ratio, not
+// position: what "a reserved slot" and "a workhorse slot" mean is the file's.
+const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
+const slotsOfWeight = (weight) => SHIPPED.flatMap((s, i) => (s.weight === weight ? [i + 1] : []))
+const HEAVY_SLOTS = slotsOfWeight(MAX_WEIGHT)
+const LIGHT_SLOTS = slotsOfWeight(Math.min(...SHIPPED.map((s) => s.weight)))
 const ALL_SLOTS = SHIPPED.map((_, i) => i + 1)
 const firstOf = (xs) => xs[0]
+// How deep the heaviest slot goes before a lightest one is engaged, derived from the
+// ratio rule rather than written as a literal: handover happens at
+// weight * PRIORITY_MARGIN / weight - PRIORITY_MARGIN claims.
+const ENGAGE_AT = Math.floor((MAX_WEIGHT * pool.PRIORITY_MARGIN) / Math.min(...SHIPPED.map((s) => s.weight))) - pool.PRIORITY_MARGIN
 
 // 1. slot N is the same model for every base, so the pool is genuinely shared
 {
@@ -93,7 +99,7 @@ const firstOf = (xs) => xs[0]
   // The claim is that base type does not matter, so the reference is the same
   // number of spawns from one base type in a fresh pool. Comparing against a run
   // instead of a literal sequence keeps this independent of both the slot
-  // numbering and the tier split in pool-models.json.
+  // numbering and the weights in pool-models.json.
   const solo = await mk("shared-1-solo", scratch())
   const soloPicks = []
   for (let i = 0; i < picks.length; i++) soloPicks.push(slotOf(await solo.spawn(`s${i}`, BASES[0])))
@@ -101,11 +107,11 @@ const firstOf = (xs) => xs[0]
     picks.join(",") === soloPicks.join(","),
     `mixed base types must follow the same shared cycle, got ${picks.join(",")}, want ${soloPicks.join(",")}`,
   )
-  // Primaries are used first and stay load-equalized, so the leading picks are
-  // primaries until the least-loaded one is TIER_MARGIN ahead.
+  // An idle pool starts on its heaviest slots, so the leading picks are heavy ones
+  // until the lightest is a full weight behind.
   assert(
-    PRIMARY_SLOTS.includes(picks[0]) && PRIMARY_SLOTS.includes(picks[1]),
-    `an idle pool must start on primaries, got ${picks.slice(0, 2).join(",")}`,
+    HEAVY_SLOTS.includes(picks[0]) && HEAVY_SLOTS.includes(picks[1]),
+    `an idle pool must start on the heaviest slots, got ${picks.slice(0, 2).join(",")}`,
   )
   assert(new Set(picks).size === ALL_SLOTS.length, "every slot must be used when base types alternate")
 }
@@ -114,13 +120,13 @@ const firstOf = (xs) => xs[0]
 //    implement-fast onto the same shared slots instead of its own
 {
   const t = await mk("shared-2", scratch())
-  for (let i = 0; i < 2 * PRIMARY_SLOTS.length; i++) await t.spawn(`x${i}`, "explore-fast") // saturates primaries
+  for (let i = 0; i < ENGAGE_AT; i++) await t.spawn(`x${i}`, "explore-fast") // deep enough to engage a lighter slot
   const afterExplore = slotOf(await t.spawn("x4", "implement-fast"))
   assert(
-    afterExplore === firstOf(OVERFLOW_SLOTS),
-    `implement-fast must land on the least-loaded slot, got ${afterExplore}`,
+    afterExplore === firstOf(LIGHT_SLOTS),
+    `implement-fast must land on the lightest slot, got ${afterExplore}`,
   )
-  assert(!PRIMARY_SLOTS.includes(afterExplore), "implement-fast must not be handed an explore-fast-loaded primary")
+  assert(!HEAVY_SLOTS.includes(afterExplore), `implement-fast must not be handed an explore-fast-loaded heavy slot`)
 }
 
 // 4. pool_status attributes load per model and names the agent types using it
@@ -143,8 +149,8 @@ const firstOf = (xs) => xs[0]
   pool.init(state, () => {})
   const snap = pool.snapshot(state)
   const slot = pool.pickSlot(state, snap)
-  // an idle pool hands out a primary, whichever primary slot the file put first
-  assert(PRIMARY_SLOTS.includes(slot.index), `an idle pool should hand out a primary slot, got ${slot.index}`)
+  // an idle pool hands out its heaviest slot, whichever one the file put first
+  assert(HEAVY_SLOTS.includes(slot.index), `an idle pool should hand out a heaviest slot, got ${slot.index}`)
   const agent = pool.agentFor("context-manager", slot.index)
   assert(agent === `context-manager-${slot.index}`, `borrowed agent name wrong: ${agent}`)
   assert(cfg.agent[agent] !== undefined, `${agent} must exist in config`)
@@ -154,12 +160,12 @@ const firstOf = (xs) => xs[0]
   assert(busy.counts.get(slot.model) === 1, "the borrowed slot must show as loaded")
   assert(busy.own.get(key).g === "ses_borrow", "the claim must target the working session for the reaper")
   // A second borrow must not land on the busy slot while another slot is
-  // eligible. With a single primary there is nothing to switch to: the only other
-  // slot is overflow and a primary keeps the lead until it is TIER_MARGIN ahead,
-  // so handing the same primary again is the pool behaving as designed, not a
-  // routing failure.
+  // eligible. With a single heavy slot there is nothing to switch to: the only
+  // other slots are lighter and stay empty until the heavy one is a full weight
+  // ahead, so handing out the same heavy slot again is the pool behaving as
+  // designed, not a routing failure.
   const slot2 = pool.pickSlot(state, pool.snapshot(state))
-  if (PRIMARY_SLOTS.length > 1) {
+  if (HEAVY_SLOTS.length > 1) {
     assert(slot2.index !== slot.index, `second borrow should avoid the busy slot, got ${slot2.index}`)
   }
   pool.release(state, key)

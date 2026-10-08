@@ -14,7 +14,8 @@ const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
 // pool-models.json owns the pool's models, so the model a hang cools is read
 // from it rather than repeated here.
-const [SLOT_PROVIDER, SLOT_MODEL_ID] = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots[0].model.split("/")
+const { splitModel } = await import(join(HERE, "..", "lib", "pool.ts"))
+const { provider: SLOT_PROVIDER, id: SLOT_MODEL_ID } = splitModel(JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots[0].model)
 
 let failures = 0
 const assert = (cond, msg) => {

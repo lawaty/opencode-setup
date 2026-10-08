@@ -16,11 +16,12 @@ const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 // pool-models.json owns the pool's models. Test 4 is about a provider-wide
 // cooldown, so it is written against whichever provider slot 1 runs on and the
 // slots on the other providers, rather than against fixed model names.
+const { splitModel } = await import(join(HERE, "..", "lib", "pool.ts"))
 const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
-const [HOT_PROVIDER, HOT_MODEL] = SLOTS[0].model.split("/") // provider whose free tier fills up
+const { provider: HOT_PROVIDER, id: HOT_MODEL } = splitModel(SLOTS[0].model) // provider whose free tier fills up
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 const sameProvider = SLOTS.filter((s) => s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => s.model)
-const otherProviders = SLOTS.filter((s) => !s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => s.model.split("/")[1])
+const otherProviders = SLOTS.filter((s) => !s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => splitModel(s.model).id)
 
 let failures = 0
 const assert = (cond, msg) => {

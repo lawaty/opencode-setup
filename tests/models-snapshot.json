@@ -1,7 +1,14 @@
 {
   "_source": "https://models.dev/api.json",
-  "_fetched": "2026-10-06",
+  "_fetched": "2026-10-08",
   "models": {
+    "opencode-go/longcat-2.5-preview-free": {
+      "cost_input": 0,
+      "cost_output": 0,
+      "context": 1000000,
+      "tool_call": true,
+      "reasoning": true
+    },
     "opencode/space-bunny-free": {
       "cost_input": 0,
       "cost_output": 0,
@@ -9,7 +16,7 @@
       "tool_call": true,
       "reasoning": true
     },
-    "opencode-go/longcat-2.5-preview-free": {
+    "opencode/longcat-2.5-preview-free": {
       "cost_input": 0,
       "cost_output": 0,
       "context": 1000000,
@@ -23,10 +30,10 @@
       "tool_call": true,
       "reasoning": true
     },
-    "opencode/nemotron-3-ultra-free": {
+    "opencode/nemotron-3.5-lightning-free": {
       "cost_input": 0,
       "cost_output": 0,
-      "context": 1000000,
+      "context": 262144,
       "tool_call": true,
       "reasoning": true
     }

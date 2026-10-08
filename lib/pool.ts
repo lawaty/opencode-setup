@@ -12,6 +12,14 @@ import { fileURLToPath } from "node:url"
 // same model, so `explore-fast-2` and `context-manager-2` are the same model and
 // share one load counter.
 //
+// Every slot carries a `weight` (pool-models.json), and that is the only knob.
+// Routing is one reduce over the slots: lowest ratio wins, ties go to the lighter
+// slot. A slot's ratio is (claims + PRIORITY_MARGIN) / weight, so a heavier slot
+// absorbs proportionally more concurrent work before the pool looks elsewhere.
+// Equal weights make that identical to comparing raw claims, and a weight of 2 over
+// weight 1 reproduces exactly what the old primary/overflow tiers did -- high-weight
+// slots run while the low-weight ones stay free as burst headroom.
+//
 // This module holds the state and the decision; plugins/agent-pool.ts owns the
 // hooks (task routing, limit detection, hang reaping) and
 // plugins/context-autoupdate.ts borrows a slot directly, because it spawns its
@@ -24,17 +32,29 @@ import { fileURLToPath } from "node:url"
 export const CLAIM_TTL_MS = 10 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
 export const ORPHAN_TMP_MS = 60 * 1000
-export const TIER_MARGIN = 2
 export const CATALOG_TTL_MS = 10 * 60 * 1000
 export const STUCK_MIN_AGE_MS = 5 * 60 * 1000
 export const STUCK_IDLE_MS = 3 * 60 * 1000
 export const HANG_COOLDOWN_MS = 10 * 60 * 1000
+// Claims every slot gets for free, before weight decides anything. This is the
+// head start that keeps low-weight slots empty as headroom: a weight-2 slot is
+// displaced only once it holds PRIORITY_MARGIN claims more than a weight-1 slot
+// at the same load, i.e. the lead the old TIER_MARGIN gave primaries.
+export const PRIORITY_MARGIN = 2
+// A weight above this stops being a preference and becomes a way to silence load
+// balancing, so it is a config error rather than a number to honour.
+export const MAX_WEIGHT = 100
+// opencode.jsonc declares exactly one hidden variant per base per slot, and a pool
+// larger than that would route to agents that do not exist, so the file is capped
+// rather than trusted: slot 5 and beyond are dropped with a warning. Four is also
+// all the pool needs -- with two providers at two slots each, a provider-wide limit
+// already takes out half of it.
+export const MAX_SLOTS = 4
 const COOLDOWN_BASE_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 15 * 60 * 1000
 const STRIKE_DECAY_MS = 30 * 60 * 1000
 
-export type Tier = "primary" | "overflow"
-export type Slot = { index: number; model: string; tier: Tier }
+export type Slot = { index: number; model: string; weight: number }
 export type Claim = { v: string; k: number; m: string; t: number; s?: string; g?: string }
 export type Strike = { model: string; until: number; strikes: number; reason: string; last: number }
 export type Sibling = { id: string; claims: Claim[] }
@@ -59,10 +79,10 @@ export const CONFIG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..")
 export const MODELS_PATH = join(CONFIG_DIR, MODELS_FILE)
 
 export const FALLBACK_SLOTS: Slot[] = [
-  { index: 1, model: "opencode/big-pickle", tier: "primary" },
-  { index: 2, model: "opencode-go/space-bunny-free", tier: "primary" },
-  { index: 3, model: "opencode/nemotron-3-ultra-free", tier: "overflow" },
-  { index: 4, model: "opencode-go/longcat-2.5-preview-free", tier: "overflow" },
+  { index: 1, model: "opencode/space-bunny-free", weight: 2 },
+  { index: 2, model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", weight: 2 },
+  { index: 3, model: "opencode/big-pickle", weight: 1 },
+  { index: 4, model: "openrouter/thinkingmachines/inkling:free", weight: 1 },
 ]
 
 export type SlotFile = { slots: Slot[]; problems: string[] }
@@ -71,6 +91,10 @@ export type SlotFile = { slots: Slot[]; problems: string[] }
 // number exists; nothing downstream can disagree with it. Every entry is
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
+//
+// Weight is preference only, so a bad one warns and falls back to 1 rather than
+// dropping the slot -- losing a model because of a typo in a multiplier would
+// cost real capacity. A slot with no weight at all is weight 1.
 export function readSlotFile(path: string = MODELS_PATH): SlotFile {
   const problems: string[] = []
   let parsed: { slots?: unknown }
@@ -85,19 +109,47 @@ export function readSlotFile(path: string = MODELS_PATH): SlotFile {
   const slots: Slot[] = []
   parsed.slots.forEach((entry, i) => {
     const model = typeof (entry as { model?: unknown })?.model === "string" ? ((entry as { model: string }).model).trim() : ""
-    const raw = (entry as { tier?: unknown })?.tier
-    const tier = raw === "primary" || raw === "overflow" ? raw : undefined
     const at = `slot ${i + 1}`
+    if (slots.length >= MAX_SLOTS) {
+      problems.push(`${at} (${model || "?"}): the pool is capped at ${MAX_SLOTS} slots (opencode.jsonc declares one variant per base per slot); entry ignored`)
+      return
+    }
     if (!model.includes("/")) return problems.push(`${at}: model must be written provider/model-id, got "${model}"`)
-    if (!tier) return problems.push(`${at} (${model}): tier must be "primary" or "overflow", got ${JSON.stringify(raw)}`)
+    const weight = readWeight(entry, at, model, problems)
     if (slots.some((s) => s.model === model)) return problems.push(`${at}: ${model} is already used by another slot; slots must be distinct models`)
-    slots.push({ index: slots.length + 1, model, tier })
+    slots.push({ index: slots.length + 1, model, weight })
   })
   if (slots.length === 0) {
     problems.push(`${path} yielded no usable slot; using built-in defaults`)
     return { slots: FALLBACK_SLOTS, problems }
   }
   return { slots, problems }
+}
+
+// `weight` is how many claims a slot may hold before the pool prefers a lighter
+// one; absent means 1. `tier` is the pre-weight spelling and is accepted as a
+// deprecated alias (primary -> 2, overflow -> 1) so a host that has not been
+// re-deployed keeps its headroom instead of silently flattening to weight 1.
+function readWeight(entry: unknown, at: string, model: string, problems: string[]): number {
+  const raw = (entry as { weight?: unknown })?.weight
+  if (raw === undefined) {
+    const legacy = (entry as { tier?: unknown })?.tier
+    if (legacy !== undefined) {
+      // One line per distinct value: warnOnce collapses the repeats, so a whole
+      // legacy file logs once for "primary" and once for "overflow".
+      problems.push(
+        `${MODELS_FILE}: "tier" is deprecated; write "weight" instead (primary is weight 2, overflow is weight 1), got ${JSON.stringify(legacy)}`,
+      )
+      if (legacy === "primary" || legacy === "overflow") return legacy === "primary" ? 2 : 1
+    }
+    return 1
+  }
+  const weight = typeof raw === "number" ? raw : Number(raw)
+  if (!Number.isFinite(weight) || weight <= 0 || weight > MAX_WEIGHT) {
+    problems.push(`${at} (${model}): weight must be a number in (0, ${MAX_WEIGHT}], got ${JSON.stringify(raw)}; using weight 1`)
+    return 1
+  }
+  return weight
 }
 
 const LIMIT_PATTERNS = [
@@ -352,24 +404,27 @@ export function snapshot(s: State): Snapshot {
 
 const loadOf = (counts: Map<string, number>, model: string) => counts.get(model) ?? 0
 
-function leastLoaded(slots: Slot[], counts: Map<string, number>) {
-  return slots.reduce((best, slot) => (loadOf(counts, slot.model) < loadOf(counts, best.model) ? slot : best), slots[0])
+// The routing metric: the lowest ratio wins, ties go to the lighter slot. A slot's
+// ratio is how loaded it is relative to how much work it is allowed to hold, so
+// dividing by weight is what makes a heavy slot preferred, while the fixed
+// PRIORITY_MARGIN keeps the first claims of every slot free of weight pressure --
+// that head start is what leaves the light slots as headroom instead of spending
+// them on the first claim. Equal weights reduce to raw load, so an unweighted file
+// routes exactly like a plain least-loaded pool.
+export const loadRatio = (slot: Slot, counts: Map<string, number>) =>
+  (loadOf(counts, slot.model) + PRIORITY_MARGIN) / slot.weight
+
+function outranks(a: Slot, b: Slot, counts: Map<string, number>) {
+  const ra = loadRatio(a, counts)
+  const rb = loadRatio(b, counts)
+  return ra === rb ? a.weight < b.weight : ra < rb
 }
 
-// Primary slots stay load-equalized and keep a TIER_MARGIN lead over the
-// least-loaded overflow slot; from the third acquire onward the sequence is
-// exactly the 1,2,3,4 cycle.
 export function pickSlot(s: State, snap: Snapshot): Slot {
   const slots = s.slots.length > 0 ? s.slots : FALLBACK_SLOTS
   const usable = slots.filter((slot) => isAvailable(s, slot.model, snap.cooling))
   const pool = usable.length > 0 ? usable : slots
-  const primaries = pool.filter((slot) => slot.tier === "primary")
-  const overflow = pool.filter((slot) => slot.tier === "overflow")
-  if (primaries.length === 0) return leastLoaded(overflow.length ? overflow : pool, snap.counts)
-  if (overflow.length === 0) return leastLoaded(primaries, snap.counts)
-  const lp = leastLoaded(primaries, snap.counts)
-  const lo = leastLoaded(overflow, snap.counts)
-  return loadOf(snap.counts, lp.model) >= loadOf(snap.counts, lo.model) + TIER_MARGIN ? lo : lp
+  return pool.reduce((best, slot) => (outranks(slot, best, snap.counts) ? slot : best), pool[0])
 }
 
 export function agentFor(base: string, slot: number) {
@@ -433,7 +488,15 @@ export function slotFor(s: State, model: string) {
   return s.slots.find((slot) => slot.model === model)
 }
 
-export const providerOf = (model: string) => model.split("/")[0] ?? model
+// Split on the first slash only: some providers (openrouter) put a vendor
+// segment in the model id itself, so a plain split("/") loses the id's tail.
+export function splitModel(model: string): { provider: string; id: string } {
+  const slash = model.indexOf("/")
+  if (slash < 0) return { provider: model, id: "" }
+  return { provider: model.slice(0, slash), id: model.slice(slash + 1) }
+}
+
+export const providerOf = (model: string) => splitModel(model).provider
 
 // opencode itself reports free-tier exhaustion per session as
 // status.type "retry" with action.reason "free_tier_limit", the provider, and

@@ -13,16 +13,19 @@ const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
 // pool-models.json owns the pool's models; the provider/modelID pairs every
 // limit event needs are split from it, so swapping a model is not a test edit.
-// Slots are also looked up by tier, since the tests care about "a primary" and
-// "an overflow", not about which number either happens to be.
+// Slots are also looked up by weight, since the tests care about "a heaviest slot"
+// and "a lightest slot", not about which number either happens to be.
+const { splitModel } = await import(join(HERE, "..", "lib", "pool.ts"))
 const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots.map((s, i) => {
-  const [provider, modelID] = s.model.split("/")
-  return { model: s.model, provider, modelID, tier: s.tier, index: i + 1 }
+  const { provider, id: modelID } = splitModel(s.model)
+  return { model: s.model, provider, modelID, weight: s.weight, index: i + 1 }
 })
 const SLOT_MODELS = SLOTS.map((s) => s.model)
 const variantOf = (slot) => `explore-fast-${slot.index}`
-const primary = () => SLOTS.find((s) => s.tier === "primary")
-const overflow = () => SLOTS.find((s) => s.tier === "overflow")
+const MAX_WEIGHT = Math.max(...SLOTS.map((s) => s.weight))
+const MIN_WEIGHT = Math.min(...SLOTS.map((s) => s.weight))
+const heaviest = () => SLOTS.find((s) => s.weight === MAX_WEIGHT)
+const lightest = () => SLOTS.find((s) => s.weight === MIN_WEIGHT)
 // model ids go into RegExp sources all over this file
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 // A stated reset and a retry-after header are about the error shape, not about
@@ -82,18 +85,18 @@ const dirB = scratch()
 // 1. a rate-limit error message cools the model and routing avoids it
 {
   const a = await mk("p1", dirA)
-  // Baseline first: an idle pool hands out a primary. Cool whichever model that
-  // spawn actually claimed (read back from the pool, not guessed from the file),
-  // so this holds whatever pool-models.json names and in whatever order.
+  // Baseline first: an idle pool hands out a heaviest slot. Cool whichever model
+  // that spawn actually claimed (read back from the pool, not guessed from the
+  // file), so this holds whatever pool-models.json names and in whatever order.
   const baseline = await a.spawn("a1")
   const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
-  assert(slot?.tier === "primary", `baseline must route to a primary, got ${baseline}`)
+  assert(slot?.weight === MAX_WEIGHT, `baseline must route to a heaviest slot, got ${baseline}`)
   await a.limitEvent(slot.provider, slot.modelID, rateError("Rate limit exceeded. Please try again later."))
   const after = []
   for (let i = 0; i < 6; i++) after.push(await a.spawn(`a${i + 2}`))
-  assert(!after.includes(baseline), `cooled primary must be skipped, got ${after.join(",")}`)
-  // a remaining primary must still take work
-  const spare = SLOTS.filter((s) => s.tier === "primary" && s.model !== slot.model)
+  assert(!after.includes(baseline), `cooled heaviest slot must be skipped, got ${after.join(",")}`)
+  // another slot of the same weight must still take work
+  const spare = SLOTS.filter((s) => s.weight === slot.weight && s.model !== slot.model)
   if (spare.length > 0) assert(after.includes(variantOf(spare[0])), `${variantOf(spare[0])} must still take work`)
   assert(/COOLING/.test(await a.status()), "status must flag the cooling model")
   assert(new RegExp(`cooling: ${escape(slot.model)}\\b`).test(await a.status()), "status must name the cooling model")
@@ -102,8 +105,8 @@ const dirB = scratch()
 // 2. unrelated errors must NOT cool anything
 {
   const b = await mk("p2", dirB)
-  await b.limitEvent(primary().provider, primary().modelID, rateError("connection reset by peer"))
-  await b.limitEvent(primary().provider, primary().modelID, { name: "UnknownError", data: { message: "tool call malformed" } })
+  await b.limitEvent(heaviest().provider, heaviest().modelID, rateError("connection reset by peer"))
+  await b.limitEvent(heaviest().provider, heaviest().modelID, { name: "UnknownError", data: { message: "tool call malformed" } })
   assert(!/COOLING/.test(await b.status()), "non-limit errors must not trigger a cooldown")
 }
 
@@ -128,7 +131,7 @@ const dirB = scratch()
 {
   const e = await mk("p5", scratch())
   const err = rateError("Rate limit exceeded")
-  const slot = primary()
+  const slot = heaviest()
   await e.limitEvent(slot.provider, slot.modelID, err)
   const first = Number(new RegExp(`${slot.modelID} for (\\d+)s`).exec(await e.status())?.[1])
   await e.limitEvent(slot.provider, slot.modelID, err)
@@ -155,7 +158,7 @@ const dirB = scratch()
 {
   const g = await mk("writer", dirA)
   const h = await mk("reader", dirA)
-  const slot = primary()
+  const slot = heaviest()
   await g.limitEvent(slot.provider, slot.modelID, rateError("Rate limit exceeded"))
   assert(/COOLING/.test(await h.status()), "a peer process must observe a cooldown written by another")
   const picks = []
@@ -167,7 +170,7 @@ const dirB = scratch()
 {
   const dir = scratch()
   const i = await mk("p8", dir)
-  await i.limitEvent(primary().provider, primary().modelID, rateError("Rate limit exceeded"))
+  await i.limitEvent(heaviest().provider, heaviest().modelID, rateError("Rate limit exceeded"))
   assert(readdirSync(dir).some((f) => f.startsWith("limit.")), "a cooldown file should be written")
   const realNow = Date.now
   Date.now = () => realNow() + 16 * 60 * 1000
@@ -188,8 +191,8 @@ const dirB = scratch()
 // 10. catalog status gates retired models (simulated by seeding serverUrl-less state)
 {
   const k = await mk("p10", scratch())
-  for (const slot of SLOTS.filter((s) => s.tier === "overflow")) {
-    assert(new RegExp(`slot ${slot.index}\\b`).test(await k.status()), `overflow slot ${slot.index} must be listed in status`)
+  for (const slot of SLOTS.filter((s) => s.weight === MIN_WEIGHT)) {
+    assert(new RegExp(`slot ${slot.index}\\b`).test(await k.status()), `lightest slot ${slot.index} must be listed in status`)
   }
   assert(existsSync(PLUGIN), "plugin file must exist")
 }

@@ -1,16 +1,22 @@
 // pool-models.json is the one file a user edits to change which models the pool
-// runs. This suite drives the config hook against temporary copies of that file
-// and against the real opencode.jsonc, proving:
+// runs, and what share of the work each one takes. This suite drives the config
+// hook against temporary copies of that file and against the real opencode.jsonc,
+// proving:
 //
-//   1. the shipped file parses, and its slots are distinct models with valid tiers
+//   1. the shipped file parses, and its slots are distinct models with valid weights
 //   2. the config hook rewrites every variant agent's model from the file, so
 //      opencode.jsonc can disagree and still lose
 //   3. a model absent from a provider whitelist is whitelisted automatically,
 //      since opencode deletes every model a provider offers that is not
 //   4. a missing or broken file degrades to the built-in defaults with a warning
 //      instead of a pool that cannot route
-//   5. slot count is not baked in: three slots route 1,2,3 and the fourth agent
+//   5. slot count is data, not code: three slots route 1,2,3 and the fourth agent
 //      name is simply absent
+//   6. weight is what decides the share of work: the heavier slot is picked
+//      roughly `weight` times as often, a bad weight warns and keeps the slot, and
+//      the pre-weight `tier` spelling still maps to the weight it used to imply
+//   7. the pool is capped at pool.MAX_SLOTS, because opencode.jsonc declares one
+//      variant per base per slot and a bigger pool would route to nothing
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -29,6 +35,7 @@ const makeClient = () => {
   const lines = []
   return { lines, client: { app: { log: async ({ body }) => void lines.push(`${body.level} ${body.message}`) } } }
 }
+const pool = await import(join(HERE, "..", "lib", "pool.ts"))
 const { AgentPool } = await import(PLUGIN)
 
 const assert = (cond, msg) => {
@@ -71,12 +78,13 @@ assert(Array.isArray(shipped.slots) && shipped.slots.length >= 2, "pool-models.j
 const ids = new Set()
 shipped.slots.forEach((slot, i) => {
   assert(typeof slot.model === "string" && slot.model.includes("/"), `slot ${i + 1} needs a provider/model-id`)
-  assert(["primary", "overflow"].includes(slot.tier), `slot ${i + 1} needs tier primary or overflow`)
+  assert(typeof slot.weight === "number" && Number.isFinite(slot.weight), `slot ${i + 1} needs a numeric weight`)
+  assert(slot.weight > 0 && slot.weight <= pool.MAX_WEIGHT, `slot ${i + 1} weight must be in (0, ${pool.MAX_WEIGHT}], got ${slot.weight}`)
   assert(!ids.has(slot.model), `slot ${i + 1} repeats ${slot.model}; slots must be distinct`)
   ids.add(slot.model)
 })
 // two providers at most half the pool, so one provider-wide limit cannot kill it
-const providers = new Set(shipped.slots.map((s) => s.model.split("/")[0]))
+const providers = new Set(shipped.slots.map((s) => pool.providerOf(s.model)))
 assert(providers.size >= 2, `the pool must span at least two providers, got ${[...providers].join(", ")}`)
 
 // 2. a different file rewrites every variant agent, even against a config that
@@ -86,9 +94,9 @@ assert(providers.size >= 2, `the pool must span at least two providers, got ${[.
 //    provider names, which must exist in the config for the hook to touch them.
 const [PROV_A, PROV_B] = [...providers]
 const swapped = [
-  { model: `${PROV_A}/fixture-primary-a`, tier: "primary" },
-  { model: `${PROV_B}/fixture-primary-b`, tier: "primary" },
-  { model: `${PROV_A}/fixture-overflow-c`, tier: "overflow" },
+  { model: `${PROV_A}/fixture-primary-a`, weight: 2 },
+  { model: `${PROV_B}/fixture-primary-b`, weight: 2 },
+  { model: `${PROV_A}/fixture-overflow-c`, weight: 1 },
 ]
 const a = await apply(file("swapped.json", { slots: swapped }))
 for (const base of BASES) {
@@ -102,7 +110,7 @@ for (const base of BASES) {
 // 3. whitelisting is automatic: without it opencode deletes the model from the
 //    provider and the agent resolves to no model at all
 for (const slot of swapped) {
-  const [provider, id] = slot.model.split("/")
+  const { provider, id } = pool.splitModel(slot.model)
   assert(a.cfg.provider[provider] !== undefined, `provider ${provider} must be configured in opencode.jsonc`)
   assert(a.cfg.provider[provider].whitelist.includes(id), `${slot.model} must be whitelisted on ${provider}`)
 }
@@ -114,7 +122,7 @@ assert(
 // check no id is duplicated. Which model to use is the shipped file's business.
 const second = await apply(file("swapped-again.json", { slots: swapped }), "swapped-again")
 for (const slot of swapped) {
-  const [provider, id] = slot.model.split("/")
+  const { provider, id } = pool.splitModel(slot.model)
   const seen = second.cfg.provider[provider].whitelist.filter((x) => x === id).length
   assert(seen <= 1, `${slot.model} must not be whitelisted twice, got ${seen}`)
 }
@@ -132,32 +140,98 @@ const fallbackPick = await missing.spawn("f1")
 assert(fallbackPick === "explore-fast-1", `defaults should still route, got ${fallbackPick}`)
 
 // 6. individual bad entries are dropped with a warning; the good slots still route
-// Three rejection rules under test, each needing a distinct violation: a repeat of
-// slot 1's model, a tier that is neither primary nor overflow, and a model with no
-// provider prefix. So the fixture needs three distinct models, one of which is a
-// deliberate repeat of a good one.
+// A bad weight is NOT in that set: it is preference only, so it warns and keeps the
+// slot at weight 1 rather than throwing away a model. Two rejection rules are under
+// test, each needing a distinct violation: a repeat of slot 1's model and a model
+// with no provider prefix.
 const GOOD_1 = `${PROV_A}/fixture-good-1`
 const GOOD_2 = `${PROV_B}/fixture-good-2`
+const GOOD_3 = `${PROV_B}/fixture-good-3`
 const broken = await apply(
   file("broken.json", {
     slots: [
-      { model: GOOD_1, tier: "primary" },
-      { model: GOOD_1, tier: "overflow" },
-      { model: GOOD_2, tier: "sideways" },
-      { model: `${PROV_B}/fixture-good-3`, tier: "overflow" },
-      { model: "fixture-no-provider", tier: "primary" },
+      { model: GOOD_1, weight: 2 },
+      { model: GOOD_1, weight: 1 },
+      { model: GOOD_2, weight: "heavy" },
+      { model: GOOD_3, weight: 1 },
+      { model: "fixture-no-provider", weight: 1 },
     ],
   }),
   "broken",
 )
 const warns = broken.warned().filter((l) => l.includes("pool-models.json") || l.includes("slot "))
 assert(warns.length === 3, `each bad entry should warn once, got ${warns.length}: ${warns.join(" | ")}`)
+assert(warns.some((l) => l.includes("weight must be a number")), `a bad weight should warn, got ${warns.join(" | ")}`)
+// the model behind the bad weight survives, only its preference is lost
+assert(
+  broken.cfg.agent["explore-fast-2"].model === GOOD_2,
+  `a slot with a bad weight must still route, got ${broken.cfg.agent["explore-fast-2"].model}`,
+)
 for (const base of BASES) {
   assert(broken.cfg.agent[`${base}-1`].model === GOOD_1, `slot 1 must run the first valid entry, got ${broken.cfg.agent[`${base}-1`].model}`)
-  assert(broken.cfg.agent[`${base}-2`].model === `${PROV_B}/fixture-good-3`, `slot 2 must run the second valid entry, got ${broken.cfg.agent[`${base}-2`].model}`)
+  assert(broken.cfg.agent[`${base}-2`].model === GOOD_2, `slot 2 must run the entry with the bad weight, got ${broken.cfg.agent[`${base}-2`].model}`)
+  assert(broken.cfg.agent[`${base}-3`].model === GOOD_3, `slot 3 must run the third valid entry, got ${broken.cfg.agent[`${base}-3`].model}`)
 }
 
-// 7. opencode.jsonc declares the variants with no model at all: the hook is the
+// 7. weight decides the share of work. Two slots on one tier-free pool, so the only
+//    thing that can separate them is the weight: a 3 vs 1 pair settles at roughly
+//    three claims on the heavy slot for every one on the light one. Measured by
+//    spawns, because the claim files pool_status reads are exactly those spawns.
+const HEAVY = `${PROV_A}/fixture-weight-heavy`
+const LIGHT = `${PROV_B}/fixture-weight-light`
+const weighted = await apply(file("weighted.json", { slots: [{ model: HEAVY, weight: 3 }, { model: LIGHT, weight: 1 }] }), "weighted")
+const tally = { [HEAVY]: 0, [LIGHT]: 0 }
+const ROUNDS = 80
+for (let i = 0; i < ROUNDS; i++) {
+  const slot = (await weighted.spawn(`w${i}`)).replace("explore-fast-", "")
+  tally[slot === "1" ? HEAVY : LIGHT]++
+}
+const share = tally[HEAVY] / ROUNDS
+assert(
+  share > 0.6 && share < 0.9,
+  `a weight-3 slot should take roughly three quarters of the spawns, got ${tally[HEAVY]}/${ROUNDS} on ${HEAVY} and ${tally[LIGHT]}/${ROUNDS} on ${LIGHT}`,
+)
+// and the config hook reports the weights it bound, so a typo is visible in the log
+assert(
+  weighted.lines.some((l) => l.includes(`1=${HEAVY} w3`) && l.includes(`2=${LIGHT} w1`)),
+  `the bind log should name each slot's weight, got ${weighted.lines.join(" | ")}`,
+)
+
+// 8. the pre-weight `tier` spelling still works, so a host that has not picked up
+//    this file keeps its headroom instead of silently flattening every slot to
+//    weight 1 -- and says so once per distinct value
+const legacy = await apply(
+  file("legacy.json", { slots: [{ model: `${PROV_A}/fixture-legacy-a`, tier: "primary" }, { model: `${PROV_B}/fixture-legacy-b`, tier: "overflow" }] }),
+  "legacy",
+)
+const legacyWarns = legacy.warned().filter((l) => l.includes("tier") && l.includes("deprecated"))
+assert(legacyWarns.length === 2, `each distinct legacy tier should warn once, got ${legacyWarns.length}: ${legacyWarns.join(" | ")}`)
+assert(
+  legacy.lines.some((l) => l.includes(`1=${PROV_A}/fixture-legacy-a w2`) && l.includes(`2=${PROV_B}/fixture-legacy-b w1`)),
+  `primary must bind as weight 2 and overflow as weight 1, got ${legacy.lines.join(" | ")}`,
+)
+
+// 9. the pool is capped: opencode.jsonc declares exactly one variant per base per
+//    slot, so a longer file would route spawns at agents that do not exist. Both
+//    halves of that are checked -- the extra entries are dropped with a warning,
+//    and the shipped file is not over the cap.
+const overCap = await apply(
+  file("over-cap.json", { slots: Array.from({ length: pool.MAX_SLOTS + 2 }, (_, i) => ({ model: `${PROV_A}/fixture-cap-${i + 1}`, weight: 1 })) }),
+  "over-cap",
+)
+const capWarns = overCap.warned().filter((l) => l.includes("capped"))
+assert(capWarns.length === 2, `each ignored entry past the cap should warn, got ${capWarns.length}: ${capWarns.join(" | ")}`)
+const capPicks = []
+for (let i = 0; i < pool.MAX_SLOTS * 2; i++) capPicks.push((await overCap.spawn(`c${i}`)).replace("explore-fast-", ""))
+assert(
+  new Set(capPicks).size === pool.MAX_SLOTS && !capPicks.includes(String(pool.MAX_SLOTS + 1)),
+  `only the first ${pool.MAX_SLOTS} slots may route, got ${[...new Set(capPicks)].join(",")}`,
+)
+assert(shipped.slots.length <= pool.MAX_SLOTS, `pool-models.json lists ${shipped.slots.length} slots, over the ${pool.MAX_SLOTS} cap`)
+const shippedVariants = Object.keys(realCfg().agent).filter((n) => /-[5-9]$/.test(n))
+assert(shippedVariants.length === 0, `opencode.jsonc must not declare a variant beyond the cap, got ${shippedVariants.join(", ")}`)
+
+// 10. opencode.jsonc declares the variants with no model at all: the hook is the
 //    only thing that puts one there, so there is nothing left to fall out of sync
 const declared = realCfg()
 for (const base of BASES) {
@@ -166,8 +240,14 @@ for (const base of BASES) {
     assert(declared.agent[`${base}-${i}`].model === undefined, `${base}-${i} must not hard-code a model`)
   }
 }
+// and exactly one per slot: an extra variant would be an agent the pool never binds
+// a model to, so it would silently inherit the session's
+for (const base of BASES) {
+  const variants = Object.keys(declared.agent).filter((n) => new RegExp(`^${base}-[0-9]+$`).test(n))
+  assert(variants.length === shipped.slots.length, `${base} must declare exactly ${shipped.slots.length} pool variants, got ${variants.join(", ")}`)
+}
 
-// 8. the real file drives the real config unchanged
+// 11. the real file drives the real config unchanged
 const live = await apply(MODELS, "live")
 shipped.slots.forEach((slot, i) => {
   for (const base of BASES) {

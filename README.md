@@ -13,17 +13,34 @@ A saturated `explore-fast` therefore cannot hide behind its own dedicated model 
 
 Four slots, each a **model** (not an agent). Slot *N* is the same model for every base
 agent, so `explore-fast-2` and `context-manager-2` are the same model sharing one load
-counter.
+counter. Four is the cap: `opencode.jsonc` declares one hidden variant per base per slot,
+and `pool-models.json` entries past the fourth are dropped with a warning.
 
-| slot | model | provider | context | tier |
+| slot | model | provider | context | weight |
 |---|---|---|---|---|
-| 1 | `big-pickle` | Zen | 200k | primary |
-| 2 | `space-bunny-free` | opencode-go | 1M | primary |
-| 3 | `nemotron-3-ultra-free` | Zen | 1M | overflow |
-| 4 | `longcat-2.5-preview-free` | opencode-go | 1M | overflow |
+| 1 | `longcat-2.5-preview-free` | opencode-go | 1M | 4 |
+| 2 | `space-bunny-free` | Zen | 1M | 1 |
+| 3 | `longcat-2.5-preview-free` | Zen | 1M | 1 |
+| 4 | `big-pickle` | Zen | 200k | 1 |
 
-All four are free (verified 0/0 cost against models.dev). Two providers, so a
-provider-wide limit can disable at most half the pool.
+All four are free (verified 0/0 cost against models.dev).
+
+Two providers, weighted on purpose: **opencode-go takes ~58% of the work, Zen ~43%**. Weight
+is per *slot*, and a slot is compared against every other slot, so a single opencode-go slot
+needs weight 4 to outweigh three Zen slots — that is the whole reason the Zen slots are flat
+at 1. The trade is deliberate and asymmetric: a provider-wide limit on Zen costs 43% of
+routing, on opencode-go 58%. Neither stops the pool; cooldowns reroute the rest to whatever is
+still available. Weight 3 on the go slot is the 50/50 split if the split should be even.
+
+Slot 1 runs LongCat with **thinking disabled**, set in `opencode.jsonc` under
+`provider.opencode-go.models`. Long thinking is its only demonstrated failure
+mode: with thinking on it intermittently stalls after its tool calls complete,
+emits a few dozen reasoning tokens and then returns nothing at all -- no text,
+no error, exit 0, hanging until killed. Measured over 8 runs with thinking on:
+2 stalls (25%), 112s-420s+. With thinking off, 13 runs, zero stalls, 35s-69s,
+and reasoning tokens drop to 0. That avoids the trigger rather than fixing the
+underlying fault, so a very long input could still surface it. Turning thinking
+back on costs reasoning quality on hard problems.
 
 Pooled base agents: **`explore-fast`**, **`implement-fast`**, **`context-manager`**.
 The expensive escalation tiers (`explore-deep`, `implement-deep`, `expert`) stay
@@ -31,12 +48,39 @@ unpooled — they are deliberate, costly, and shouldn't compete for free-tier ca
 
 ### Routing
 
-Load is counted **per model across all agent types**, so total pressure stays balanced:
+Load is counted **per model across all agent types**, so total pressure stays balanced.
+Each slot's `weight` in `pool-models.json` is the only knob that decides the share of
+work. Routing is one pass over the slots: **lowest ratio wins, ties go to the lighter
+slot.**
 
-- the two primary slots are kept equal and hold a `TIER_MARGIN = 2` lead over the
-  least-loaded overflow slot
-- from the third spawn onward the sequence is exactly the cycle `1,2,3,4`
-- 6 concurrent tasks → `2/2/1/1`; 12 → `4/4/2/2`
+```
+load ratio = (in-flight claims + 2) / weight
+```
+
+`pool_status` prints that ratio per slot, so the pick is readable without running
+anything: the slot marked `<- next` is the one the next spawn takes.
+
+- weight `1` fills evenly with its peers; nothing is held back
+- weight `2` is the usual workhorse: the pool moves on once it holds 2 claims more than a
+  weight-1 slot, so the light slots stay empty as **headroom** for a burst
+- weight `3`+ leans harder on a model you trust more; the per-slot share approaches
+  the weight ratio once the pool is busy (3 vs 1 settles at roughly 3:1)
+- weight `0.5` deprioritises a slot without removing it from the pool
+
+The `+2` is a free head start for every slot; without it the first claim would land on
+each slot in turn and nothing would ever be held in reserve. Ties go to the *lighter* slot
+so a heavy one gets exactly its weight and not one claim more.
+
+With the shipped weights the opencode-go slot soaks up bursts on its own and the Zen slots
+fill in only once it is 6 ahead — 6 concurrent → `6/0/0/0`, 12 → `9/1/1/1`, and by 16 it
+settles at the ~58/43 split:
+
+```
+1,1,1,1,1,1,2,3,4,1,1,1,1,2,3,4
+```
+
+Before the go slot was weighted, the same weights read `1,2,1,2,3,4,1,2,…` with 6 concurrent
+→ `2/2/1/1` — the old primary/overflow cycle, which is what weight 2 over weight 1 still gives.
 
 Two agents reach the pool differently, and both share one state:
 
@@ -85,16 +129,23 @@ routing reads every sibling file. Cooldowns are one file per model for the same 
 
 ```
 opencode.jsonc            agents, permissions, provider whitelists (no pool models)
+AGENTS.md                 global instructions, auto-loaded into every session
 bin/oc, bin/oc-sync       launcher and deploy script; hosts come from the gitignored .env
-pool-models.json          the pool's models and tiers -- the file you edit
+commands/context-*.md     /context-init, /context-update, /context-review
 lib/pool.ts               shared pool state + slot decision (imported by both plugins)
 lib/writer-rule.ts        startup check that the one-writer permission rule fires
 plugins/agent-pool.ts     hooks: task routing, limit detection, hang reaper, pool_status
 plugins/context-autoupdate.ts
                           keeps .opencode/context/ current; borrows a pool slot
+pool-models.json          the pool's models and weights -- the file you edit
+rules/browser.md          Playwright anti-loop rules, loaded via `instructions`
 .opencode/prompts/        per-agent prompts
-tests/                    6 test suites, no network needed
+tests/                    7 test suites, no network needed
 ```
+
+`AGENTS.md`, `commands/` and `rules/` are the context-map protocol, and `oc-sync` ships
+all three to the remote hosts. They are also why `.opencode/context/` is *not* wired
+into `instructions`: the protocol is small enough to inject everywhere, the map is not.
 
 `lib/` lives outside `plugins/` on purpose: opencode loads **every export** of every file
 in `plugins/` as a plugin and uses the return value as a hooks object, so a stray export
@@ -160,25 +211,35 @@ owns the list, the config hook derives everything else from it, and the tests fa
   SDK and the runtime agree; a mismatch is silent, since only `tool()` is called at runtime
   and nothing type-checks in production. Check `package.json` on each machine before
   assuming parity.
-- `bin/oc-sync` distributes this setup to remote hosts (`--with-config` also pushes
-  `lib/`, which the plugins import). The script lives in the repo; host names, addresses
-  and usernames live in `.env`, which is gitignored. `.env.example` is the template and
-  `~/bin/oc-sync` is a symlink to the repo copy.
+- `bin/oc-sync` distributes this setup to remote hosts. `--with-config` pushes
+  `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`, `AGENTS.md`,
+  `commands/` and `rules/` — all but `.opencode/context/`, the derived map each host
+  rebuilds for itself. `AGENTS.md`, `commands/` and `rules/` are load-bearing: they carry
+  the context-map protocol that opencode injects into every session, and a host missing
+  them runs agents that skip the map while believing the protocol is already loaded. The
+  script lives in the repo; host names, addresses and usernames live in `.env`, which is
+  gitignored. `.env.example` is the template and `~/bin/oc-sync` is a symlink to the repo
+  copy.
 
 ## Inspecting it at runtime
 
-`pool_status` reports live load per model and per agent type, the tier split, cooldowns
-with remaining seconds, and a per-process breakdown:
+`pool_status` reports live load per model and per agent type, each slot's weight and load
+ratio, which slot the next spawn would take, cooldowns with remaining seconds, and a
+per-process breakdown:
 
 ```
-slot 1 primary  opencode/big-pickle  load=2  [explore-fastx1 context-managerx1]
-slot 2 primary  opencode-go/space-bunny-free  load=1  [implement-fastx1]
-slot 3 overflow opencode/nemotron-3-ultra-free  load=0  [idle]
+shared pool over 4 free models from pool-models.json; bases: explore-fast, implement-fast, context-manager
+lowest load ratio wins, ties to the lighter slot: ratio = (claims + 2) / weight
+slot 1 w4  opencode-go/longcat-2.5-preview-free  load=2  ratio=1.00 <- next  [explore-fastx1 context-managerx1]
+slot 2 w1  opencode/space-bunny-free  load=1  ratio=3.00  [implement-fastx1]
+slot 3 w1  opencode/big-pickle  load=0  ratio=2.00  [idle]
 
 watchdog alive: last sweep 4s ago (every 30s).
 ```
 
-The `watchdog alive` line is the cheap way to confirm the reaper is actually running
+`ratio` is the routing metric, so the slots that will actually be used next are the ones
+with the lowest ratio, not the emptiest ones. `watchdog alive` is
+the cheap way to confirm the reaper is actually running
 without waiting for a hang — the reaper logs nothing when it finds nothing, so a silent
 log is not evidence of a dead timer. Each process also logs one `reaper armed` line at
 startup.

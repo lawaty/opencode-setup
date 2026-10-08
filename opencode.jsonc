@@ -697,6 +697,9 @@
       }
     }
   },
+  "instructions": [
+    "rules/browser.md"
+  ],
   "mcp": {
     "playwright": {
       "type": "local",
@@ -715,16 +718,31 @@
     "opencode": {
       "whitelist": [
         "big-pickle",
-        "nemotron-3-ultra-free"
-      ]
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+        "longcat-2.5-preview-free"
+      ],
+      "models": {
+        "longcat-2.5-preview-free": {
+          "options": {
+            "thinking": { "type": "disabled" }
+          }
+        }
+      }
     },
     "opencode-go": {
       "whitelist": [
         "deepseek-v4-flash",
         "glm-5.2",
-        "longcat-2.5-preview-free",
-        "space-bunny-free"
-      ]
+        "longcat-2.5-preview-free"
+      ],
+      "models": {
+        "longcat-2.5-preview-free": {
+          "options": {
+            "thinking": { "type": "disabled" }
+          }
+        }
+      }
     }
   }
 }

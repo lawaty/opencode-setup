@@ -190,8 +190,9 @@ export const ContextAutoUpdate = (async ({ client, directory }) => {
         // counts it and the pool's hang reaper can abort this session directly.
         const claimKey = pool.claimKey(target, "context-autoupdate")
         pool.acquire(state, "context-manager", slot, target, claimKey, target)
-        await log("info", `borrowed pool slot ${slot.index} (${slot.model}, ${slot.tier}) for auto ${mode}`, {
+        await log("info", `borrowed pool slot ${slot.index} (${slot.model}, w${slot.weight}) for auto ${mode}`, {
           slot: slot.index,
+          weight: slot.weight,
           model: slot.model,
         })
 

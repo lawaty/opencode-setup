@@ -8,7 +8,7 @@ and how the pieces are distributed.
 
 | Path | Role |
 |---|---|
-| `pool-models.json` | the pool's models and tiers — the only file to edit to swap a model |
+| `pool-models.json` | the pool's models and weights — the only file to edit to swap a model or change its share of the work |
 | `opencode.jsonc` | 19 agents (3 pooled bases + 12 hidden variants + 4 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
 | `lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
 | `lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
@@ -43,12 +43,30 @@ Edit `pool-models.json` — one entry per slot, array position is the slot numbe
 
 ```json
 { "slots": [
-  { "model": "opencode/big-pickle", "tier": "primary" },
-  { "model": "opencode-go/space-bunny-free", "tier": "primary" },
-  { "model": "opencode/nemotron-3-ultra-free", "tier": "overflow" },
-  { "model": "opencode-go/longcat-2.5-preview-free", "tier": "overflow" }
+  { "model": "opencode-go/longcat-2.5-preview-free", "weight": 4 },
+  { "model": "opencode/space-bunny-free", "weight": 1 },
+  { "model": "opencode/longcat-2.5-preview-free", "weight": 1 },
+  { "model": "opencode/big-pickle", "weight": 1 }
 ] }
 ```
+
+At most **4 slots**: `opencode.jsonc` declares one hidden variant per base per slot, so a
+fifth entry would route spawns at an agent that does not exist. Entries past the fourth are
+dropped with a warning, not silently ignored.
+
+`weight` is the share knob, and it is **per slot, not per provider**: a slot is compared
+against every other slot, so making one provider's model run more often than another's means
+weighting it against each competing slot — the opencode-go slot carries weight 4 against
+three Zen slots at 1, which measures ~58% opencode-go / ~43% Zen. Weight 3 there is an even
+split. Routing is one pass over the slots: **lowest ratio wins, ties go to the lighter slot**,
+where `ratio = (in-flight claims + 2) / weight` — so a slot may hold roughly `weight` times
+the claims of a lighter one before the pool looks elsewhere. `weight: 2` over `weight: 1` is the usual shape —
+the heavy slots do the work and the light ones stay empty as burst headroom. Raise a weight
+to lean on a model you trust more (the per-slot share approaches the weight ratio once the
+pool is busy), lower it toward `0.5` to deprioritise one without removing it. No weight means
+`1`; anything that is not a number in `(0, 100]` warns and means `1`. The old `tier` key is
+still read as a deprecated alias — `primary` is weight 2, `overflow` is weight 1 — with a
+warning, so a host that has not picked up this file keeps its headroom.
 
 Do **not** also edit the variant agents in `opencode.jsonc` — they carry no `model` on
 purpose. The plugin's config hook writes `<base>-<slot>` for `explore-fast`,
@@ -62,17 +80,18 @@ capable — check with `curl -sS https://models.dev/api.json` or `opencode model
 
 ```bash
 opencode debug agent explore-fast-1   # model it resolved
-opencode run "pool_status"            # slots, load, cooldowns
+opencode run "pool_status"            # slots, weight, load ratio, cooldowns
 ```
 
-Failure modes are logged, never silent: a bad entry (no `provider/model-id`, an unknown
-tier, a repeated model) is dropped with a warning and the other slots still route; a file
-that yields nothing usable falls back to the built-in defaults. Both appear in the log as
+Failure modes are logged, never silent: a bad entry (no `provider/model-id`, a repeated
+model, a fifth slot) is dropped with a warning and the other slots still route; a bad
+`weight` is only a preference, so it warns and keeps the slot at weight 1; a file that
+yields nothing usable falls back to the built-in defaults. All of them appear in the log as
 `pool-models.json …`, so check
 `tail -f ~/.local/share/opencode/log/opencode.log | grep pool-models` when a spawn
-resolves to the wrong model. If the plugin is disabled (`opencode --pure`) the variants
-have no model at all and inherit the session's — check the plugin is loading before
-debugging a wrong model.
+resolves to the wrong model or lands on an unexpected slot. If the plugin is disabled
+(`opencode --pure`) the variants have no model at all and inherit the session's — check the
+plugin is loading before debugging a wrong model.
 
 ## Restarts
 
@@ -127,8 +146,19 @@ bin/oc-sync --with-config --dry-run # preview
 bin/oc-sync --host <alias>          # one host
 ```
 
-Pushes `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/` — with a
-remote backup first.
+Pushes `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`,
+`AGENTS.md`, `commands/`, `rules/` — with a remote backup first.
+
+**`AGENTS.md`, `commands/` and `rules/` are not optional extras.** `AGENTS.md` is the
+global instruction file opencode auto-loads into every session, and `commands/` +
+`rules/` are what it points at. A host missing them runs agents that were never told
+`.opencode/context/` exists, and they will report skipping the map while claiming the
+protocol was loaded. That is exactly what happened: one host carried a 368-byte stub
+`AGENTS.md` claiming the protocol arrived via `instructions` in `opencode.jsonc` — a key
+that was never added — while another had no `AGENTS.md` at all. Both were in git and in
+`OPERATIONS.md`, so the bug was invisible locally. If a host's agents ever deny reading
+the map, diff the remote's `AGENTS.md` byte count against the local one before touching
+anything else.
 
 A failed transfer is a failure, not a detail: every rsync's exit status is checked
 before its output is filtered, and the host is listed under `failed` with the
@@ -173,8 +203,16 @@ derived artifact — an index regenerated from the source by `context-manager`, 
 itself — and it is scoped to one machine's filesystem. Syncing it would push a
 description of this host's projects onto hosts that have different ones, and committing it
 would churn on every session that touches a file. Git holds the rules that generate it
-(`AGENTS.md`, `rules/context-protocol.md`, `commands/context-*.md`, the plugin, the tests);
-the map itself is rebuilt on demand by the next cartographer run.
+(`AGENTS.md`, `commands/context-*.md`, `rules/browser.md`, the plugin, the tests) and all
+of those now ship to the remotes; the map itself is rebuilt on demand by the next
+cartographer run.
+
+There is no `rules/context-protocol.md` anymore. It duplicated the global `AGENTS.md`
+while nothing loaded it, so it was deleted; `rules/browser.md` survives because its
+Playwright anti-loop rules exist nowhere else and are now loaded through the
+`instructions` key in `opencode.jsonc`. The context map is deliberately **not** in
+`instructions` — that would inject all five files into every session and every pooled
+subagent, defeating the read-one-file rule `AGENTS.md` states.
 
 Trigger: a root session goes idle after editing files outside the map. It borrows a pool
 slot, spawns `context-manager`, and applies changes. `context-manager` is the single
@@ -219,9 +257,11 @@ in `~/.local/share/opencode/` where it is.
 
 ## Troubleshooting
 
-**A pooled spawn went to an unexpected model.** Read the `routed` log line for the
-`slot=` and `tier=` fields, then check for a `limit.<provider>__<model>.json` file — a
-stale one with a future `until` will keep diverting work.
+**A pooled spawn went to an unexpected model.** Read the `routed` log line for the `slot=`,
+`weight=` and `ratio=` fields, then check for a `limit.<provider>__<model>.json` file — a
+stale one with a future `until` will keep diverting work. If the model is right but the slot
+is not the emptiest one, that is the weight: routing compares `(claims + 2) / weight`, not
+raw load.
 
 **Everything routes to one provider.** Check for `limit.*.json` files cooling the other.
 A provider-wide `free_tier_limit` cools every slot on that provider at once, which is
