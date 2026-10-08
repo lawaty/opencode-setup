@@ -4,7 +4,11 @@
 #
 # Usage:
 #   bin/oc-sync                 sync `oc` to every host
-#   bin/oc-sync --with-config   also rsync opencode.jsonc, pool-models.json, lib/, plugins/ and .opencode/
+#   bin/oc-sync --with-config   also rsync opencode.jsonc, pool-models.json, lib/, plugins/,
+#                               .opencode/, AGENTS.md, commands/ and rules/
+#   bin/oc-sync --with-auth     also copy MISSING provider credentials into each host's
+#                               opencode auth.json (merge-only: never overwrites a key a
+#                               host already has, and never prints one)
 #   bin/oc-sync --dry-run ...   show what would change, write nothing
 #   bin/oc-sync --host NAME ... limit to one host
 #
@@ -21,6 +25,16 @@
 #     ssh-config alias, so OC_HOSTS lists aliases, not addresses.
 #   * A failing host must not abort the run, so nothing relies on `set -e`.
 #   * Every ssh is wrapped in `timeout`; rc edits are idempotent.
+#
+# Credentials are NOT part of --with-config, deliberately: the pool spans providers
+# (Zen, openrouter, ...), and a host missing one silently fails every task routed
+# to it. But the keys are per-host, not shared -- each host carries its own Zen/Go
+# keys, which differ from this machine's (see .env) -- so pushing this
+# machine's whole auth.json would replace credentials those hosts depend on.
+# --with-auth therefore MERGES: a host receives only the providers it lacks, and an
+# existing key is never overwritten. Keys travel over the ssh that is already being
+# used, are never written to disk here, and are never echoed: output names the
+# provider and nothing else.
 
 set -uo pipefail
 
@@ -50,15 +64,17 @@ SSH_BASE=(ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=
 SSH_STDIN=(ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15)
 
 WITH_CONFIG=0
+WITH_AUTH=0
 DRY_RUN=0
 ONLY_HOST=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-config) WITH_CONFIG=1 ;;
+    --with-auth) WITH_AUTH=1 ;;
     --dry-run|-n)  DRY_RUN=1 ;;
     --host)        ONLY_HOST="${2:-}"; shift ;;
-    -h|--help)     sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -185,6 +201,172 @@ REMOTE
 FAILED=()
 DONE=()
 
+# ---------------------------------------------------------------------------
+# Credentials: merge only, and never reveal a key.
+#
+# opencode reads auth.json from its data dir, not from the config repo, so this is
+# the one thing --with-config cannot carry. A host missing a provider the pool
+# routes to fails every task sent to it, with a message ("API key is missing")
+# that looks like a model bug rather than a provisioning gap.
+#
+# Merge, do not copy. Each host's keys are its own; replacing them with this
+# machine's would break hosts that are working today. So for each host we ask
+# which providers it already has, and send only the remainder. The merge happens
+# in python on the far side, reading the new entries from stdin, so a key is
+# never written to a temp file here and never appears in a command line (where
+# it would land in the remote shell history and in this process's argv).
+AUTH_FILE="${OC_AUTH_FILE:-$HOME/.local/share/opencode/auth.json}"
+
+# Names only: provider -> its key, for the ones listed in $2. Used to build the
+# payload without ever printing a key.
+auth_subset() {
+  python3 - "$AUTH_FILE" "$@" <<'PY'
+import json, sys
+path = sys.argv[1]
+want = set(sys.argv[2:])
+try:
+    with open(path) as fh:
+        auth = json.load(fh)
+except FileNotFoundError:
+    sys.exit(3)
+out = {k: v for k, v in auth.items() if (not want or k in want) and isinstance(v, dict) and v.get("key")}
+print(json.dumps(out))
+PY
+}
+
+# Providers the host already has, one per line, via the ssh already in use.
+remote_auth_providers() {
+  timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$1" \
+    'python3 -c "
+import json, os, sys
+p = os.path.expanduser(\"~/.local/share/opencode/auth.json\")
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+print(\" \".join(k for k, v in d.items() if isinstance(v, dict) and v.get(\"key\")))
+"' 2>/dev/null
+}
+
+# Merge the missing providers into the host auth.json.
+#
+# The payload is embedded in the script body rather than piped in beside it. ssh
+# has exactly one stdin, and it is already carrying the script that bash -s
+# executes, so a second stream is not available; a heredoc inside the generated
+# script gives the payload its own place without ever putting it in argv (where
+# it would show up in the remote process table) or in a temp file. The key lives
+# only in this shell's memory and in the ssh pipe.
+#
+# Writes nothing unless the merge succeeds, keeps a timestamped backup, and prints
+# "oc-auth|..." lines the caller renders: provider names, never keys.
+remote_auth_merge() {
+  local host="$1" payload="$2"
+  # One line, so it cannot collide with the heredoc terminator below.
+  [[ "$payload" != *$'\n'* ]] || { echo "oc-auth|err:payload must be single-line"; return 1; }
+  {
+    printf 'set -u\n'
+    printf 'DRY=%q\n' "$DRY_RUN"
+    printf 'AUTH="$HOME/.local/share/opencode/auth.json"\n'
+    printf 'emit() { echo "oc-auth|$1"; }\n'
+    printf 'mkdir -p "$(dirname "$AUTH")" || { emit "err:could not create auth dir"; exit 0; }\n'
+    printf "PAYLOAD=\$(cat <<'PAYLOAD_EOF'\n"
+    printf '%s\n' "$payload"
+    printf 'PAYLOAD_EOF\n)\n'
+    cat <<'REMOTE_TAIL'
+[ -n "$PAYLOAD" ] || { emit "warn:empty payload, nothing merged"; exit 0; }
+if [ "$DRY" = "1" ]; then
+  PROVIDERS="$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))')"
+  emit "ok:[dry-run] would add $PROVIDERS to ~auth.json"
+  exit 0
+fi
+# Merge in python so a malformed payload cannot truncate the file: the existing
+# store is read, updated, and only then written via a temp file + rename, which
+# is atomic, so a crash mid-write leaves the original intact.
+printf '%s' "$PAYLOAD" | python3 -c '
+import json, os, shutil, sys, time
+auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
+new = json.load(sys.stdin)
+if not isinstance(new, dict) or not new:
+    print("REJECT:payload is not a non-empty object"); raise SystemExit(0)
+try:
+    cur = json.load(open(auth_path))
+    if not isinstance(cur, dict):
+        raise ValueError("existing auth.json is not an object")
+except FileNotFoundError:
+    cur = {}
+except Exception as e:
+    print("REJECT:existing auth.json unreadable (%s)" % e); raise SystemExit(0)
+# never overwrite: a key the host already has wins over ours
+added = [k for k in new if k not in cur]
+kept = [k for k in new if k in cur]
+cur.update({k: v for k, v in new.items() if k in added})
+shutil.copy2(auth_path, auth_path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+tmp = auth_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(cur, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, auth_path)
+print("ADDED:" + " ".join(sorted(added)))
+if kept:
+    print("KEPT:" + " ".join(sorted(kept)))
+'
+rc=$?
+[ $rc -eq 0 ] || emit "err:merge helper failed"
+REMOTE_TAIL
+  } | timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s
+}
+
+sync_auth() {
+  local host="$1"
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    warn "no local auth.json at $AUTH_FILE; run 'opencode auth login' first"
+    FAILED+=("$host")
+    return 1
+  fi
+  local have payload
+  have="$(remote_auth_providers "$host")"
+  local -a missing=()
+  local provider
+  for provider in $(auth_subset | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))'); do
+    case " $have " in *" $provider "*) ;; *) missing+=("$provider") ;; esac
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "auth: host already has ${have:-no providers}, nothing to add"
+    return 0
+  fi
+  payload="$(auth_subset "${missing[@]}")" || { bad "could not read $AUTH_FILE"; FAILED+=("$host"); return 1; }
+  local out
+  out="$(remote_auth_merge "$host" "$payload")" || { bad "auth merge failed on $host"; FAILED+=("$host"); return 1; }
+  local line reported=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local msg="${line#oc-sync|}"
+    case "$msg" in
+      ok:*)   ok "auth: ${msg#ok:}"; reported=1 ;;
+      warn:*) warn "auth: ${msg#warn:}"; reported=1 ;;
+      err:*)  bad "auth: ${msg#err:}"; FAILED+=("$host"); reported=1 ;;
+    esac
+  done <<< "$out"
+  # The python helper reports the outcome on plain lines (ADDED:/KEPT:/REJECT:),
+  # not through emit, so they arrive unprefixed. A missing REJECT means the merge
+  # ran; silence entirely means it did not, and must not be reported as success.
+  local added kept
+  added="$(sed -n 's/^ADDED://p' <<< "$out")"
+  kept="$(sed -n 's/^KEPT://p' <<< "$out")"
+  if grep -q '^REJECT:' <<< "$out"; then
+    bad "auth: merge rejected on $host (${out%%$'\n'*})"
+    FAILED+=("$host")
+    return 1
+  fi
+  [[ -n "$added" ]] && ok "auth: added $added$([ -n "$kept" ] && printf ' (kept existing: %s)' "$kept")"
+  if [[ $reported -eq 0 && -z "$added" ]]; then
+    bad "auth: merge produced no confirmation on $host - treat as not applied"
+    FAILED+=("$host")
+    return 1
+  fi
+}
+
 for HOST in "${HOSTS[@]}"; do
   HOST="${HOST%$'\r'}"
   stripped="${HOST//[[:space:]]/}"
@@ -228,10 +410,10 @@ for HOST in "${HOSTS[@]}"; do
   if [[ $WITH_CONFIG -eq 1 ]]; then
     echo "  --- opencode config ---"
     if [[ $DRY_RUN -eq 1 ]]; then
-      ok "[dry-run] would rsync opencode.jsonc, pool-models.json, lib/, plugins/, .opencode/ (remote backed up first)"
+      ok "[dry-run] would rsync opencode.jsonc, pool-models.json, lib/, plugins/, .opencode/, AGENTS.md, commands/, rules/ (remote backed up first)"
     else
       if timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" \
-           "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc pool-models.json .opencode plugins lib 2>/dev/null" >/dev/null 2>&1; then
+           "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc pool-models.json .opencode plugins lib AGENTS.md commands rules 2>/dev/null" >/dev/null 2>&1; then
         ok "remote config backed up to ~/opencode-config-backup-*.tar.gz"
       else
         warn "remote backup failed - skipping config sync for this host"
@@ -254,6 +436,20 @@ for HOST in "${HOSTS[@]}"; do
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1
         push "plugins/" "$CONFIG_DIR/plugins/" "${HOST}:~/.config/opencode/plugins/" || continue
       fi
+      # AGENTS.md is the global instruction file opencode auto-loads into every
+      # session, and commands/ + rules/ back it. Without these three a host runs
+      # agents that were never told the .opencode/context map exists: one host
+      # carried a 368-byte stub pointing at a rules file no config ever loaded,
+      # another had no AGENTS.md at all. Both then reported skipping the map.
+      if [[ -f "$CONFIG_DIR/AGENTS.md" ]]; then
+        push "AGENTS.md" "$CONFIG_DIR/AGENTS.md" "${HOST}:~/.config/opencode/" || continue
+      fi
+      for DIR in commands rules; do
+        if [[ -d "$CONFIG_DIR/$DIR" ]]; then
+          timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" "mkdir -p ~/.config/opencode/$DIR" >/dev/null 2>&1
+          push "$DIR/" "$CONFIG_DIR/$DIR/" "${HOST}:~/.config/opencode/$DIR/" || continue
+        fi
+      done
       if [[ -d "$CONFIG_DIR/.opencode" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/.opencode' >/dev/null 2>&1
         # .opencode/context/ is the derived map of whatever projects a host
@@ -264,6 +460,10 @@ for HOST in "${HOSTS[@]}"; do
       # node_modules / package-lock.json / tests/ are intentionally not synced:
       # each host keeps its own install and SDK version.
     fi
+  fi
+
+  if [[ $WITH_AUTH -eq 1 ]]; then
+    sync_auth "$HOST"
   fi
 
   ok "done"
@@ -290,10 +490,11 @@ else
   echo "  failed : none"
 fi
 [[ $DRY_RUN -eq 1 ]] && echo "  dry run: nothing was written"
-if [[ $WITH_CONFIG -eq 0 ]]; then
+if [[ $WITH_CONFIG -eq 0 && $WITH_AUTH -eq 0 ]]; then
   echo
   echo "  note: this only synced the \`oc\` script."
-  echo "        re-run with --with-config to also push opencode.jsonc, pool-models.json, lib/, plugins/ and .opencode/"
+  echo "        re-run with --with-config to also push opencode.jsonc, pool-models.json, lib/, plugins/, .opencode/, AGENTS.md, commands/ and rules/"
+  echo "        and/or --with-auth to add any provider credentials a host is missing"
 fi
 [[ ${#FAILED[@]} -gt 0 ]] && exit 1
 exit 0
