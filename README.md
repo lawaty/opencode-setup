@@ -19,8 +19,8 @@ and `pool-models.json` entries past the fourth are dropped with a warning.
 | slot | model | provider | context | weight (ceiling) |
 |---|---|---|---|---|
 | 1 | `longcat-2.5-preview-free` | opencode-go | 1M | 3 |
-| 2 | `big-pickle` | Zen | 200k | 2 |
-| 3 | `space-bunny-free` | Zen | 1M | 1 |
+| 2 | `space-bunny-free` | Zen | 1M | 2 |
+| 3 | `big-pickle` | Zen | 200k | 1 |
 | 4 | `longcat-2.5-preview-free` | Zen | 1M | 1 |
 
 All four are free (verified 0/0 cost against models.dev). Weight is **a ceiling on how many
@@ -55,7 +55,7 @@ same number is the priority**. The rule is two lines:
 1,1,1, 2,2, 3, 4, ...      weights 3,2,1,1
 ```
 
-The main model gets its 3 sessions to itself, then big-pickle takes 2, then space-bunny and
+The main model gets its 3 sessions to itself, then space-bunny takes 2, then big-pickle and
 Zen longcat take 1 each — no model is asked to multiplex past its ceiling while another sits
 idle, which is what keeps per-session latency sane on a small free model.
 
@@ -217,9 +217,9 @@ shared pool over 4 free models from pool-models.json; bases: explore-fast, imple
 lowest load ratio wins, ties to the lighter slot: ratio = (claims + 2) / weight
 priority is weight: the heaviest slot under its ceiling takes the next spawn
 slot 1 w3  opencode-go/longcat-2.5-preview-free  load=2/3  [explore-fastx1 context-managerx1]
-slot 2 w2  opencode/big-pickle  load=0/2  [idle]
-slot 3 w1  opencode/space-bunny-free  load=1/1 FULL  [implement-fastx1]
-slot 4 w1  opencode/longcat-2.5-preview-free  load=0/1  [idle]
+slot 2 w2  opencode/space-bunny-free  load=1/2  [implement-fastx1]
+slot 3 w1  opencode/big-pickle  load=0/1  [idle]
+slot 4 w1  opencode/longcat-2.5-preview-free  load=1/1 FULL  [explore-fastx1]
 
 watchdog alive: last sweep 4s ago (every 30s).
 ```

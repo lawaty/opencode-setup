@@ -44,8 +44,8 @@ Edit `pool-models.json` — one entry per slot, array position is the slot numbe
 ```json
 { "slots": [
   { "model": "opencode-go/longcat-2.5-preview-free", "weight": 3 },
-  { "model": "opencode/big-pickle", "weight": 2 },
-  { "model": "opencode/space-bunny-free", "weight": 1 },
+  { "model": "opencode/space-bunny-free", "weight": 2 },
+  { "model": "opencode/big-pickle", "weight": 1 },
   { "model": "opencode/longcat-2.5-preview-free", "weight": 1 }
 ] }
 ```
