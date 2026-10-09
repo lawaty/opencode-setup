@@ -1,0 +1,133 @@
+// Notification policy for plugins/notify.ts: which session transitions are worth
+// a desktop notification, and what it should say.
+//
+// This is lib/, not plugins/, for the same reason lib/writer-rule.ts is: opencode
+// treats every export of a file in plugins/ as a plugin and calls it with the
+// plugin input, then uses the return value as its hooks object. A plain helper
+// exported from there is invoked with the wrong arguments and poisons the hook
+// registry, which stops the process starting.
+//
+// Everything here is pure so the policy can be tested without a running server.
+
+const INTERNAL_TITLE_PREFIXES = [
+  // context-autoupdate spawns the cartographer through the session API, with no
+  // parentID, so it looks exactly like a root session going idle. Notifying for
+  // it would announce the cartographer's own bookkeeping as a finished task.
+  "context-manager (auto",
+]
+
+// Title text for the notification body. Kept short on purpose: it is a desktop
+// line, not a report, and the session is named so the user can find it.
+export const notifyMessage = (outcome: "done" | "error", detail?: string) => {
+  if (outcome === "error") return detail ? `Failed — ${detail}` : "Failed"
+  return "Ready for you"
+}
+
+export type SessionInfo = {
+  id?: string
+  parentID?: string
+  title?: string
+  time?: { compacting?: number }
+}
+
+export type Decision = { notify: true; title: string; message: string; urgency: "normal" | "critical" } | { notify: false; reason: string }
+
+// A session title is user-visible text that lands in a notification, so it is
+// stripped of control characters and length-capped rather than trusted.
+export const safeTitle = (raw: string | undefined, fallback = "session") => {
+  if (!raw) return fallback
+  // eslint-disable-next-line no-control-regex
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim()
+  if (!clean) return fallback
+  return clean.length > 90 ? `${clean.slice(0, 89)}…` : clean
+}
+
+// Why a given session transition should not raise a notification.
+export const shouldNotify = (input: {
+  info: SessionInfo | undefined
+  outcome: "done" | "error"
+  detail?: string
+  // A session created but never prompted is an empty shell, not finished work.
+  sawMessage?: boolean
+}): Decision => {
+  const { info, outcome, detail } = input
+
+  if (!info?.id) return { notify: false, reason: "no session info" }
+
+  // Subagents. This is the suppression the whole design turns on: every
+  // explore-fast/implement-fast child session idles when it finishes, and a
+  // session that dispatched ten of them would otherwise announce ten "ready"
+  // notifications for work the user never asked about individually.
+  if (info.parentID) return { notify: false, reason: "subagent" }
+
+  const title = safeTitle(info.title)
+
+  if (INTERNAL_TITLE_PREFIXES.some((prefix) => title.startsWith(prefix))) {
+    return { notify: false, reason: "internal session" }
+  }
+
+  // Compaction rewrites history and idles the session, but no task finished:
+  // the user is still mid-conversation. Sending "ready for you" here would
+  // train them to dismiss the notification without reading it.
+  if (info.time?.compacting) return { notify: false, reason: "compacting" }
+
+  if (outcome === "done" && input.sawMessage === false) {
+    return { notify: false, reason: "no work done" }
+  }
+
+  return {
+    notify: true,
+    title: `opencode — ${title}`,
+    message: notifyMessage(outcome, detail),
+    urgency: outcome === "error" ? "critical" : "normal",
+  }
+}
+
+// Rate limit. A root session can idle more than once in quick succession (a
+// queued message, a retry, an abort), and a burst of identical notifications is
+// worse than none. One per session per window.
+const MAX_TRACKED = 500
+
+export class Notifier {
+  private readonly lastSent = new Map<string, number>()
+  // Not a constructor parameter property: this module is loaded by node's
+  // type-stripping loader, which does not support the shorthand.
+  private readonly windowMs: number
+
+  constructor(windowMs: number) {
+    this.windowMs = windowMs
+  }
+
+  allow(sessionID: string, now: number) {
+    const previous = this.lastSent.get(sessionID)
+    if (previous !== undefined && now - previous < this.windowMs) return false
+    this.record(sessionID, now)
+    return true
+  }
+
+  // Record without asking. Used by the error path, which must bypass the window
+  // rather than be blocked by it, but still needs the timestamp refreshed.
+  record(sessionID: string, now: number) {
+    this.lastSent.set(sessionID, now)
+    this.evict(now)
+  }
+
+  private evict(now: number) {
+    if (this.lastSent.size <= MAX_TRACKED) return
+    // Drop oldest-first, not oldest-that-happens-to-be-expired: a burst of
+    // sessions inside one window would otherwise all be "too recent" and the map
+    // would keep growing, which is the exact leak this bound exists for. Map
+    // preserves insertion order, and insertion order is send order.
+    let excess = this.lastSent.size - MAX_TRACKED
+    for (const key of this.lastSent.keys()) {
+      if (excess-- <= 0) break
+      this.lastSent.delete(key)
+    }
+  }
+
+  // Exposed so the eviction test can assert on it: the map is otherwise
+  // unreachable from outside, which would make the bound untestable.
+  lastSentSize() {
+    return this.lastSent.size
+  }
+}

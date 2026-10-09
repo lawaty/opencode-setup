@@ -127,10 +127,13 @@ lib/writer-rule.ts        startup check that the one-writer permission rule fire
 plugins/agent-pool.ts     hooks: task routing, limit detection, hang reaper, pool_status
 plugins/context-autoupdate.ts
                           keeps .opencode/context/ current; borrows a pool slot
+plugins/notify.ts         desktop notification when a root session finishes;
+                          subagents and the cartographer are suppressed
+lib/notify.ts             the notification policy, pure and testable
 pool-models.json          the pool's models and weights -- the file you edit
 rules/browser.md          Playwright anti-loop rules, loaded via `instructions`
 .opencode/prompts/        per-agent prompts
-tests/                    8 test suites, no network needed
+tests/                    9 test suites, no network needed
 ```
 
 `AGENTS.md`, `commands/` and `rules/` are the context-map protocol, and `oc-sync` ships
@@ -159,7 +162,12 @@ node tests/pool-timer-test.mjs  # reaper on a timer with no new spawns
 node tests/pool-models-test.mjs # pool-models.json drives agents, whitelists, fallbacks
 node tests/permission-test.mjs  # the one-writer rule actually matches the map path
 node tests/oc-test.mjs          # oc/oc-sync: default flags, tunnel auth, notification wiring
+node tests/notify-test.mjs      # finish notifications: suppression policy, cooldown, wiring
 ```
+
+`notify-test.mjs` needs node ≥ 22 for type stripping; hosts with an older system
+node (one is on 12) cannot import the `.ts` modules directly. opencode itself is
+unaffected — it loads plugins with its own bundled runtime.
 
 `pool-timer-test.mjs` and the `AI_APICallError` cases in `pool-limits-test.mjs` are
 regressions for two bugs that reached production: the reaper originally ran only on the

@@ -228,6 +228,38 @@ ssh <alias> 'OC_LOCAL_USER=lawaty ~/bin/oc-notify "test" "hello"'
 No output means it landed. See `.opencode/context/` for the map, and `tests/oc-test.mjs`
 for the checks that keep this wired.
 
+### "Ready for you" when a task finishes
+
+`plugins/notify.ts` raises a notification when a session finishes, named after the
+session, so a long task does not need a watched terminal. It is auto-discovered from
+`plugins/` — no config entry — and the policy lives in `lib/notify.ts`, pure and
+testable without a running server.
+
+```
+opencode — Fix the login redirect     Ready for you
+opencode — Deploy run                  Failed   (critical)
+```
+
+What is deliberately **not** notified:
+
+- **Subagents.** `parentID` is set, so ten delegated `explore-fast` children raise
+  zero notifications. The value is one notice per thing you asked for.
+- **The cartographer.** `context-autoupdate` spawns `context-manager` through the
+  session API with no `parentID`, so it is indistinguishable from a root session by
+  structure alone; it is matched by title prefix instead. Without this, every file
+  edit would announce the map update.
+- **Compaction.** It idles the session but no task finished, and "ready" there
+  trains you to dismiss the notice unread.
+- **Sessions that never went busy.** Opening opencode is not completing work.
+
+A 5s cooldown per session absorbs queued-message and retry bursts, but errors bypass
+it — a failure must not be swallowed by the cooldown the `busy` transition left
+behind. Restart opencode to load a plugin change; plugins are not hot-reloaded.
+
+The delivery path is `bin/oc-notify`, the same one `oc` uses, spawned detached so a
+notification can never hold the server open. There is deliberately no second
+implementation of the return trip.
+
 **Host details live in `.env`, not in the repo.** The repo is public, so `bin/oc-sync`
 carries no names, addresses or usernames: it reads `OC_HOSTS` (whitespace, comma or
 newline separated) and optional overrides from `.env`, which `.gitignore` keeps out of
