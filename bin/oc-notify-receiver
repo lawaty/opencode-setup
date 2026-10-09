@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Local end of the oc-notify reverse tunnel. A remote host's `oc` reaches this
+# over an SSH RemoteForward and passes the notification as SSH_ORIGINAL_COMMAND.
+#
+# This is wired into ~/.ssh/authorized_keys as a forced command with `restrict`,
+# so the tunnel key can do exactly this and nothing else: no shell, no PTY, no
+# agent or port forwarding. Do not relax those options.
+#
+# It parses argv rather than re-running the string, so a remote cannot smuggle a
+# second command through SSH_ORIGINAL_COMMAND. The only value it interpolates
+# into a notify-send call is the icon, and that is whitelisted.
+
+set -uo pipefail
+
+TITLE="${1:-OpenCode}"
+MSG="${2:-}"
+URGENCY="${3:-normal}"
+ICON="${4:-utilities-terminal}"
+
+case "$URGENCY" in
+  low|normal|critical) ;;
+  *) URGENCY=normal ;;
+esac
+
+case "$ICON" in
+  utilities-terminal|dialog-information|dialog-error|dialog-warning|system-run|emblem-default) ;;
+  *) ICON=utilities-terminal ;;
+esac
+
+# This runs as your desktop user on your desktop machine, so the session bus is
+# whatever the session actually uses. Fall back to the common X11 layouts only
+# when the inherited environment has neither.
+export DISPLAY="${DISPLAY:-:0}"
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+fi
+
+if ! command -v notify-send >/dev/null 2>&1; then
+  echo "oc-notify: notify-send is not installed on this machine" >&2
+  exit 127
+fi
+
+exec notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON"

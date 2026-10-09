@@ -146,13 +146,19 @@ Audited, and most of it is structural rather than redundant:
 ## Deploying to the other hosts
 
 ```bash
-bin/oc-sync --with-config           # every host in $OC_HOSTS
-bin/oc-sync --with-config --dry-run # preview
-bin/oc-sync --host <alias>          # one host
+bin/oc-sync                    # every host in $OC_HOSTS, config included
+bin/oc-sync --dry-run          # preview, writes nothing
+bin/oc-sync --host <alias>     # one host
+bin/oc-sync --scripts-only     # only `oc`, NOT the config
 ```
 
-Pushes `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`,
-`AGENTS.md`, `commands/`, `rules/` — with a remote backup first.
+Pushes `oc`, `oc-notify`, the tunnel key, `opencode.jsonc`, `pool-models.json`, `lib/`,
+`plugins/`, `.opencode/`, `AGENTS.md`, `commands/`, `rules/` — with a remote backup first.
+
+**The config is the default, not an opt-in.** Plain `bin/oc-sync` used to ship only `oc`,
+which meant a fix to `AGENTS.md` stayed on this machine while hosts kept the old rules.
+The run looked successful. Use `--scripts-only` when you genuinely want just the
+launcher.
 
 **`AGENTS.md`, `commands/` and `rules/` are not optional extras.** `AGENTS.md` is the
 global instruction file opencode auto-loads into every session, and `commands/` +
@@ -172,6 +178,55 @@ all, locally or on the remote — it reports the `~/bin` PATH line, `OC_LOCAL_US
 `authorized_keys` entries it *would* add. `.opencode/context/` is excluded from the
 transfer: it is the derived map of whatever projects a host works on, so each host
 regenerates its own.
+
+`oc-sync` passes `ClearAllForwardings=yes` to every ssh and rsync it makes. With
+`RemoteForward` configured, each of its ~12 calls per host would otherwise compete for
+tunnel port 10022 and print `remote port forwarding failed`; a half-claimed listener can
+also block the one session that actually needs the tunnel to notify you. The script never
+needs a forward — the interactive `oc` session makes its own connection.
+
+### Desktop notifications from a remote session
+
+`oc` raises a notification on this machine when a session started on a host ends. The
+return path is an SSH `RemoteForward`, so it works with no publicly reachable IP.
+
+```bash
+# on THIS machine, once per host in ~/.ssh/config
+Host <alias>
+  RemoteForward 10022 localhost:22
+
+# on the desktop machine (oc-sync does both)
+~/.ssh/oc_notify                     # dedicated keypair
+~/.local/bin/oc-notify-receiver      # forced command the key is restricted to
+```
+
+`oc-sync` provisions all of it, and the key is **dedicated** — never your personal key.
+Its `authorized_keys` entry carries `restrict` plus `command=`, so a host holding the
+private half can raise a notification and nothing else: no shell, no PTY, no forwarding.
+The notification travels as argv, not as a shell string, and the receiver validates the
+urgency and icon against a whitelist.
+
+Three things that each broke this before, worth knowing if it fails again:
+
+- **The dbus path must be the *local* uid.** The old script built the notify command on
+  the host, where `id -u` is `0` for root, producing `/run/user/0/bus` — which does not
+  exist on the desktop. Every notification vanished silently.
+- **`RemoteForward` has to be on the alias you actually connect through.** `dev-host` and
+  `192.0.2.10` are the same machine; only the bare IP had the forward, so
+  `oc-sync` (which uses the alias) brought up no tunnel at all.
+- **Only one session per host can hold port 10022.** A second concurrent session cannot
+  bind it and its notification fails; `oc` says so explicitly rather than failing
+  quietly. Multiplexing (`ControlMaster`) does *not* fix this and makes it worse — a
+  master whose channel has died keeps the port and swallows the connection.
+
+Verify end to end in one line:
+
+```bash
+ssh <alias> 'OC_LOCAL_USER=lawaty ~/bin/oc-notify "test" "hello"'
+```
+
+No output means it landed. See `.opencode/context/` for the map, and `tests/oc-test.mjs`
+for the checks that keep this wired.
 
 **Host details live in `.env`, not in the repo.** The repo is public, so `bin/oc-sync`
 carries no names, addresses or usernames: it reads `OC_HOSTS` (whitespace, comma or

@@ -115,7 +115,12 @@ routing reads every sibling file. Cooldowns are one file per model for the same 
 ```
 opencode.jsonc            agents, permissions, provider whitelists (no pool models)
 AGENTS.md                 global instructions, auto-loaded into every session
-bin/oc, bin/oc-sync       launcher and deploy script; hosts come from the gitignored .env
+bin/oc, bin/oc-notify     launcher (wraps opencode, notifies the local desktop) and a
+                          single-notification helper
+bin/oc-notify-receiver    the forced command a remote may run through the SSH tunnel;
+                          installed to ~/.local/bin, never run from the repo
+bin/oc-sync               deploy script; pushes oc, the tunnel key and the whole
+                          opencode config. Hosts come from the gitignored .env
 commands/context-*.md     /context-init, /context-update, /context-review
 lib/pool.ts               shared pool state + slot decision (imported by both plugins)
 lib/writer-rule.ts        startup check that the one-writer permission rule fires
@@ -125,7 +130,7 @@ plugins/context-autoupdate.ts
 pool-models.json          the pool's models and weights -- the file you edit
 rules/browser.md          Playwright anti-loop rules, loaded via `instructions`
 .opencode/prompts/        per-agent prompts
-tests/                    7 test suites, no network needed
+tests/                    8 test suites, no network needed
 ```
 
 `AGENTS.md`, `commands/` and `rules/` are the context-map protocol, and `oc-sync` ships
@@ -153,6 +158,7 @@ node tests/pool-shared-test.mjs # slots shared across base agent types
 node tests/pool-timer-test.mjs  # reaper on a timer with no new spawns
 node tests/pool-models-test.mjs # pool-models.json drives agents, whitelists, fallbacks
 node tests/permission-test.mjs  # the one-writer rule actually matches the map path
+node tests/oc-test.mjs          # oc/oc-sync: default flags, tunnel auth, notification wiring
 ```
 
 `pool-timer-test.mjs` and the `AI_APICallError` cases in `pool-limits-test.mjs` are
@@ -196,10 +202,12 @@ owns the list, the config hook derives everything else from it, and the tests fa
   SDK and the runtime agree; a mismatch is silent, since only `tool()` is called at runtime
   and nothing type-checks in production. Check `package.json` on each machine before
   assuming parity.
-- `bin/oc-sync` distributes this setup to remote hosts. `--with-config` pushes
-  `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`, `AGENTS.md`,
+- `bin/oc-sync` distributes this setup to remote hosts, config included by default
+  (`--scripts-only` opts out). It pushes `oc`, `oc-notify`, a dedicated SSH tunnel key,
+  and `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`, `AGENTS.md`,
   `commands/` and `rules/` — all but `.opencode/context/`, the derived map each host
-  rebuilds for itself. `AGENTS.md`, `commands/` and `rules/` are load-bearing: they carry
+  rebuilds for itself. The default used to be scripts-only, which silently left every host
+  on the old `AGENTS.md` while the run reported success. `AGENTS.md`, `commands/` and `rules/` are load-bearing: they carry
   the context-map protocol that opencode injects into every session, and a host missing
   them runs agents that skip the map while believing the protocol is already loaded. The
   script lives in the repo; host names, addresses and usernames live in `.env`, which is

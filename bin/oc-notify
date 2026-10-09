@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# oc-notify — send one desktop notification through the same tunnel `oc` uses,
+# without starting an opencode session. Handy for scripting, and for testing the
+# tunnel: a success here means notifications are wired up on both ends.
+#
+# Usage: oc-notify TITLE [MESSAGE] [URGENCY] [ICON]
+#   URGENCY: low | normal | critical   (default normal)
+#
+# Keys: OC_TUNNEL_PORT, OC_LOCAL_USER, OC_NOTIFY=0 (see bin/oc).
+set -uo pipefail
+
+# Reuse oc's tunnel logic rather than duplicating it, so the two can never drift.
+OC_NOTIFY_ONLY=1 exec "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/oc" "$@"

@@ -1,86 +1,174 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Tunnel port for reverse SSH notifications.
-# Set up RemoteForward 10022:localhost:22 in ~/.ssh/config on your local
-# machine for each remote host. This creates a reverse tunnel so the remote
-# can reach your local SSH daemon via localhost:10022 without needing a
-# publicly reachable IP.
-REVERSE_TUNNEL_PORT="${OC_TUNNEL_PORT:-10022}"
+# oc — start opencode and raise a desktop notification when the session ends.
+#
+# Why a wrapper at all: a session started over ssh on a remote host has no
+# display, so nothing tells you the agent finished. This runs opencode normally
+# and notifies your LOCAL desktop when the session starts, succeeds, or fails.
+# Notification failure never changes opencode's exit code.
+#
+# The remote -> local hop uses an SSH RemoteForward, so it works with no
+# publicly reachable IP (the usual case behind NAT). oc-sync installs the
+# required pieces on both ends:
+#
+#   local  ~/.ssh/authorized_keys   forced command + `restrict`, see
+#                                    ~/.local/bin/oc-notify-receiver
+#          ~/.ssh/oc_notify         keypair used ONLY for that hop
+#   remote ~/.ssh/oc_notify         private half, used only for that hop
+#   remote ~/bin/oc                 this script
+#
+# Three things this deliberately does NOT do, each of which is a trap:
+#
+#   * It does not build a notify-send command string and hand it to a remote
+#     shell. The command is sent as argv and executed LOCALLY by the forced
+#     command, so a remote host cannot append a second command to it.
+#   * It does not build the dbus path from the REMOTE uid. `id -u` on a root host
+#     is 0, and /run/user/0/bus does not exist on your desktop — the old script
+#     did exactly that, which silently sent every notification into the void.
+#   * It does not ship your personal SSH private key to the hosts. It uses a
+#     dedicated key that the local authorized_keys entry restricts to the
+#     notifier: no shell, no PTY, no forwarding.
+#
+# Usage:
+#   oc                      # start opencode, notify at the end
+#   oc --host 1.2.3.4 ...   # any opencode flags pass straight through
+#   oc-notify TITLE MSG [URGENCY] [ICON]
+#                          # send one notification and exit, no opencode
+#
+# Tunables:
+#   OC_TUNNEL_PORT    local port of the reverse tunnel (default 10022)
+#   OC_LOCAL_USER     your local username, if it differs from the remote one
+#   OC_NOTIFY         0 disables notifications entirely
+#
+# Notification failures print a one-line warning to stderr at most once per
+# session, and never change the exit code.
 
-# Local username for reverse tunnel. Set this if your local desktop username
-# differs from the remote user (common case). Example: OC_LOCAL_USER=lawaty
-OC_LOCAL_USER="${OC_LOCAL_USER:-}"
+TUNNEL_PORT="${OC_TUNNEL_PORT:-10022}"
+LOCAL_USER="${OC_LOCAL_USER:-}"
+ENABLED="${OC_NOTIFY:-1}"
+WARNED=0
 
-# Determine if we are on a remote machine
-IS_REMOTE=false
-LOCAL_IP=""
-if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
-  IS_REMOTE=true
-  LOCAL_IP="$(echo "$SSH_CLIENT" | awk '{print $1}')"
-fi
+# An icon that actually exists on the local desktop. Anything else here shows up
+# as a generic placeholder, so keep this list to shipped icon-theme names.
+DEFAULT_ICON=utilities-terminal
 
-send_notify() {
-  local TITLE="$1"
-  local MSG="$2"
-  local URGENCY="${3:-normal}"
-  local ICON="${4:-utilities-terminal}"
-
-  # Build the notify-send command to run on the local machine
-  local NOTIFY_CMD
-  NOTIFY_CMD=$(printf \
-    "DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus notify-send '%s' '%s' --urgency=%s --icon=%s" \
-    "$TITLE" "$MSG" "$URGENCY" "$ICON")
-
-  if [[ "$IS_REMOTE" == "true" ]]; then
-    # Priority 1 — reverse tunnel via RemoteForward (works behind NAT)
-    if [[ -n "$OC_LOCAL_USER" ]]; then
-      ssh -p "$REVERSE_TUNNEL_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes \
-          -o ConnectTimeout=3 "${OC_LOCAL_USER}@localhost" \
-          "$NOTIFY_CMD" 2>/dev/null && return 0 || true
-    fi
-
-    # Try without explicit user (works if remote user matches local)
-    ssh -p "$REVERSE_TUNNEL_PORT" -o StrictHostKeyChecking=no -o BatchMode=yes \
-         -o ConnectTimeout=3 localhost \
-         "$NOTIFY_CMD" 2>/dev/null && return 0 || true
-
-    # Priority 2 — direct SSH back via SSH_CLIENT IP (works on LAN / VPN)
-    if [[ -n "$LOCAL_IP" ]]; then
-      if [[ -n "$OC_LOCAL_USER" ]]; then
-        ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 \
-            "${OC_LOCAL_USER}@${LOCAL_IP}" \
-            "$NOTIFY_CMD" 2>/dev/null && return 0 || true
-      fi
-
-      ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 \
-           "$LOCAL_IP" \
-           "$NOTIFY_CMD" 2>/dev/null && return 0 || true
-    fi
-
-    echo "oc: warning: could not send notification" >&2
-    echo "  Set OC_LOCAL_USER=lawaty (or your local username)" >&2
-    echo "  and ensure your key is in local authorized_keys." >&2
-    return 1
-  else
-    notify-send "$TITLE" "$MSG" --urgency="$URGENCY" --icon="$ICON"
-  fi
+warn() {
+  echo "oc: $*" >&2
 }
 
-# If invoked as oc-notify (symlink or direct call), run notify and exit
-if [[ "$(basename "$0")" == "oc-notify" ]]; then
-  send_notify "$@" || true
-  exit $?
+warn_once() {
+  [[ "$WARNED" -eq 1 ]] && return 0
+  WARNED=1
+  warn "$*"
+}
+
+# Notification icon, normalised locally: the remote picks a name, but whether it
+# resolves depends on the icon theme installed here, not there.
+normalize_icon() {
+  case "${1:-$DEFAULT_ICON}" in
+    dialog-error|dialog-warning|dialog-information|utilities-terminal|system-run|emblem-default) printf '%s' "$1" ;;
+    "") printf '%s' "$DEFAULT_ICON" ;;
+    *) printf '%s' "$DEFAULT_ICON" ;;
+  esac
+}
+
+# Send one notification to the local desktop.
+#   $1 title  $2 message  $3 urgency  $4 icon
+#
+# Returns non-zero if it could not be delivered. No output on success, because
+# these run inside command substitution and would otherwise pollute callers.
+send_notify() {
+  local title="${1:-OpenCode}" msg="${2:-}" urgency="${3:-normal}" icon
+  icon="$(normalize_icon "${4:-}")"
+
+  case "$urgency" in
+    low|normal|critical) ;;
+    *) urgency=normal ;;
+  esac
+
+  if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
+    # Remote: hop home over the reverse tunnel. The key is scoped by
+    # authorized_keys to the notifier only, so this cannot open a shell here.
+    local -a target=()
+    if [[ -n "$LOCAL_USER" ]]; then target=(-p "$TUNNEL_PORT" "${LOCAL_USER}@localhost"); else target=(-p "$TUNNEL_PORT" localhost); fi
+
+    if [[ -f "$HOME/.ssh/oc_notify" ]]; then
+      if ssh "${target[@]}" \
+           -i "$HOME/.ssh/oc_notify" \
+           -o IdentitiesOnly=yes \
+           -o StrictHostKeyChecking=accept-new \
+           -o BatchMode=yes \
+           -o ConnectTimeout=5 \
+           -o LogLevel=ERROR \
+           "$title" "$msg" "$urgency" "$icon" 2>/dev/null; then
+        return 0
+      fi
+    else
+      warn_once "no tunnel key at ~/.ssh/oc_notify — run 'bin/oc-sync --with-config' on this host"
+    fi
+  else
+    # Local: notify straight to the desktop session.
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send "$title" "$msg" --urgency="$urgency" --icon="$icon" >/dev/null 2>&1 && return 0
+    fi
+  fi
+
+  warn_once "could not reach the local desktop over tunnel port $TUNNEL_PORT. Common causes:"
+  warn_once "  (a) this is a second concurrent session to the same host -- the first one owns port $TUNNEL_PORT and only one session can hold it"
+  warn_once "  (b) ~/.ssh/config has no 'RemoteForward $TUNNEL_PORT localhost:22' for this host"
+  warn_once "  (c) OC_LOCAL_USER is unset and the local username differs from $(id -un)"
+  return 1
+}
+
+# oc-notify: send a single notification and exit without starting opencode.
+# oc-notify reuses this file's send_notify via bin/oc-notify, which execs us with
+# OC_NOTIFY_ONLY set. An env var rather than $0: the wrapper has to exec us by
+# absolute path to find us, so the name we were invoked under is not preserved.
+if [[ -n "${OC_NOTIFY_ONLY:-}" ]]; then
+  send_notify "${1:-OpenCode}" "${2:-}" "${3:-normal}" "${4:-}" || true
+  exit 0
 fi
 
-send_notify "OpenCode" "Starting OpenCode session..." || true
+# Locate the opencode binary.
+#
+# Not just `command -v opencode`: that only finds it when PATH has been set up by
+# an interactive shell. opencode lives in ~/.opencode/bin, which on these hosts is
+# added by .bashrc -- so `oc` invoked from tmux, a detached session, cron, or any
+# non-interactive ssh died with 127 while an interactive shell worked fine. Same
+# binary, same host, different PATH: so check the usual install locations too.
+resolve_opencode() {
+  if command -v opencode >/dev/null 2>&1; then
+    command -v opencode
+    return 0
+  fi
+  local candidate
+  for candidate in "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode /usr/bin/opencode; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
-opencode "$@"
+OPENCODE_BIN="$(resolve_opencode)"
+if [[ -z "$OPENCODE_BIN" ]]; then
+  echo "oc: cannot find the opencode binary on PATH or in ~/.opencode/bin" >&2
+  exit 127
+fi
 
+if [[ "$ENABLED" != "1" ]]; then
+  exec "$OPENCODE_BIN" "$@"
+fi
+
+send_notify "OpenCode" "Starting session..." || true
+
+"$OPENCODE_BIN" "$@"
 EXIT_CODE=$?
 
 if [[ $EXIT_CODE -eq 0 ]]; then
-  send_notify "OpenCode" "Session completed successfully" || true
+  send_notify "OpenCode" "Session finished" || true
 else
   send_notify "OpenCode" "Session exited with code $EXIT_CODE" "critical" || true
 fi
