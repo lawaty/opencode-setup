@@ -9,13 +9,13 @@ and how the pieces are distributed.
 | Path | Role |
 |---|---|
 | `pool-models.json` | the pool's models and weights — the only file to edit to swap a model or change how many sessions it runs |
-| `opencode.jsonc` | 19 agents (3 pooled bases + 12 hidden variants + 4 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
+| `opencode.jsonc` | 21 agents (3 pooled bases + 12 hidden variants + 6 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
 | `lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
 | `lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
 | `plugins/agent-pool.ts` | task routing, limit detection, 30s hang reaper, `pool_status` |
 | `plugins/context-autoupdate.ts` | keeps `.opencode/context/` current; borrows a pool slot |
-| `.opencode/prompts/` | 6 prompts shared by 19 agents |
-| `tests/` | 7 offline suites, no network, no running server |
+| `.opencode/prompts/` | 7 prompts shared by 21 agents |
+| `tests/` | 9 offline suites, no network, no running server |
 
 ## Health checks
 
@@ -109,11 +109,11 @@ look applied and still not be running. Swapping a pool model is where it matters
 the file says one thing, a long-running server keeps routing to the old one. Always check `ps -eo pid,lstart,comm | grep opencode`
 against the file mtime before concluding a change is live.
 
-## Why opencode.jsonc is ~730 lines
+## Why opencode.jsonc is ~800 lines
 
 Audited, and most of it is structural rather than redundant:
 
-- **12 of the 19 agents are pool variants** (`explore-fast-1..4`, `implement-fast-1..4`,
+- **12 of the 21 agents are pool variants** (`explore-fast-1..4`, `implement-fast-1..4`,
   `context-manager-1..4`). Each must be a distinct agent because each must resolve a
   distinct model, and opencode has no agent inheritance, so each repeats its base's
   prompt and permission block. Generating them from the plugin does not work: an agent
@@ -179,86 +179,111 @@ all, locally or on the remote — it reports the `~/bin` PATH line, `OC_LOCAL_US
 transfer: it is the derived map of whatever projects a host works on, so each host
 regenerates its own.
 
-`oc-sync` passes `ClearAllForwardings=yes` to every ssh and rsync it makes. With
-`RemoteForward` configured, each of its ~12 calls per host would otherwise compete for
-tunnel port 10022 and print `remote port forwarding failed`; a half-claimed listener can
-also block the one session that actually needs the tunnel to notify you. The script never
-needs a forward — the interactive `oc` session makes its own connection.
+`oc-sync` passes `ClearAllForwardings=yes` to every ssh and rsync it makes. Each of its
+~12 calls per host would otherwise compete for the tunnel ports and print `remote port
+forwarding failed`; a half-claimed listener can also block the session that actually
+needs the tunnel to notify you. The script itself never needs a forward — the
+`oc-tunnel@<host>` units below hold those, and they are the only thing that should.
 
 ### Desktop notifications from a remote session
 
-`oc` raises a notification on this machine when a session started on a host ends. The
-return path is an SSH `RemoteForward`, so it works with no publicly reachable IP.
+A notification raised on a host has to travel back to the desktop. The desktop is
+behind NAT, so a direct ssh back times out and the return path must be a reverse
+tunnel — but *who owns that tunnel* is the part that used to be wrong.
+
+`oc-sync` installs one **systemd --user unit per host**, `oc-tunnel@<alias>`, holding
+`ssh -N -T -R <port>:localhost:22 <alias>` with `Restart=always` and `enable-linger`.
+Each host gets its own port, derived from its name. On the desktop side the
+provisioning is the same as before: a dedicated `~/.ssh/oc_notify` keypair (never your
+personal key — this private half is on every host) whose `authorized_keys` entry
+carries `restrict` plus `command=`, so a host can raise a notification and nothing
+else.
 
 ```bash
-# on THIS machine, once per host in ~/.ssh/config
-Host <alias>
-  RemoteForward 10022 localhost:22
-
-# on the desktop machine (oc-sync does both)
-~/.ssh/oc_notify                     # dedicated keypair
-~/.local/bin/oc-notify-receiver      # forced command the key is restricted to
+systemctl --user status 'oc-tunnel@<alias>'   # is the tunnel up?
+cat ~/.config/opencode/remote.env             # this host's desktop user + port
 ```
 
-`oc-sync` provisions all of it, and the key is **dedicated** — never your personal key.
-Its `authorized_keys` entry carries `restrict` plus `command=`, so a host holding the
-private half can raise a notification and nothing else: no shell, no PTY, no forwarding.
-The notification travels as argv, not as a shell string, and the receiver validates the
-urgency and icon against a whitelist.
+Four things that each broke this before, worth knowing if it fails again:
 
-Three things that each broke this before, worth knowing if it fails again:
-
+- **The tunnel must not belong to a login session.** It used to be a
+  `RemoteForward` line in `~/.ssh/config`, so the listener existed only while whichever
+  ssh connection won the port race was alive. On dev-host a session started at 13:54
+  and the tunnel's owner at 15:19: five tasks finished in between and notified a port
+  that did not exist. Nothing said so, because the local end is a forced command — it
+  simply had nothing listening. The unit fixes the lifetime; `oc-sync` now removes the
+  config lines (backed up to `~/.ssh/config.ocsync-backup`) so they cannot win the port
+  back and then drop it when you close that terminal.
+- **The desktop user must not come from the rc files.** `OC_LOCAL_USER` is exported
+  from `.bashrc`/`.profile`, which covers an interactive ssh and nothing else. The
+  notify plugin calls `oc-notify` as a *detached child of an already-running server*,
+  so it was unset, the fallback was `id -un` = `root`, and the hop died with
+  `root@localhost: Permission denied (publickey,password)`. Hence
+  `~/.config/opencode/remote.env`: readable by anything, rewritten on every sync. `oc`
+  refuses to guess a username rather than produce a confusing publickey failure.
 - **The dbus path must be the *local* uid.** The old script built the notify command on
   the host, where `id -u` is `0` for root, producing `/run/user/0/bus` — which does not
   exist on the desktop. Every notification vanished silently.
-- **`RemoteForward` has to be on the alias you actually connect through.** `dev-host` and
-  `192.0.2.10` are the same machine; only the bare IP had the forward, so
-  `oc-sync` (which uses the alias) brought up no tunnel at all.
-- **Only one session per host can hold port 10022.** A second concurrent session cannot
-  bind it and its notification fails; `oc` says so explicitly rather than failing
-  quietly. Multiplexing (`ControlMaster`) does *not* fix this and makes it worse — a
-  master whose channel has died keeps the port and swallows the connection.
+- **One alias per machine in `.env`.** `dev-host` and `192.0.2.10` are the same host;
+  listing both installs two units and flaps `remote.env` between ports on every sync.
 
-Verify end to end in one line:
+Verify end to end, in the *worst* environment — a bare env is exactly how the plugin
+calls it, so if this passes the plugin's path works:
 
 ```bash
-ssh <alias> 'OC_LOCAL_USER=lawaty ~/bin/oc-notify "test" "hello"'
+ssh <alias> 'env -i HOME="$HOME" PATH=/usr/bin:/bin SSH_CLIENT="1.2.3.4 0 22"   setsid ~/bin/oc-notify "tunnel check" "post-sync smoke"'
 ```
 
-No output means it landed. See `.opencode/context/` for the map, and `tests/oc-test.mjs`
-for the checks that keep this wired.
+No output means it landed. A failure now says which of the three things is missing.
+See `tests/oc-test.mjs` for the checks that keep this wired.
 
-### "Ready for you" when a task finishes
+### When a session needs you
 
-`plugins/notify.ts` raises a notification when a session finishes, named after the
+`plugins/notify.ts` raises a notification when a session needs you, named after the
 session, so a long task does not need a watched terminal. It is auto-discovered from
 `plugins/` — no config entry — and the policy lives in `lib/notify.ts`, pure and
 testable without a running server.
 
 ```
-opencode — Fix the login redirect     Ready for you
-opencode — Deploy run                  Failed   (critical)
+opencode — Fix the login redirect     Task finished, waiting for your review
+opencode — Deploy run                  Awaiting your response — Which option?
+opencode — Deploy run                  Failed                        (critical)
 ```
+
+Both are about what *you* must do, not about what opencode did. "Session finished" was
+the old wording and it overstated things twice over: the session is still open, and
+there was no name on it.
 
 What is deliberately **not** notified:
 
+- **Session start.** It interrupts to say nothing — no result, no title, nothing to act
+  on. A notification you learn to dismiss on sight is one you dismiss when it matters.
+  `oc` no longer sends one either.
 - **Subagents.** `parentID` is set, so ten delegated `explore-fast` children raise
   zero notifications. The value is one notice per thing you asked for.
 - **The cartographer.** `context-autoupdate` spawns `context-manager` through the
   session API with no `parentID`, so it is indistinguishable from a root session by
   structure alone; it is matched by title prefix instead. Without this, every file
   edit would announce the map update.
-- **Compaction.** It idles the session but no task finished, and "ready" there
-  trains you to dismiss the notice unread.
+- **Compaction.** It idles the session but no task finished.
 - **Sessions that never went busy.** Opening opencode is not completing work.
+- **The idle that follows a question.** The task is parked, not finished, so it is one
+  blocked moment reported once — and once you answer, the real completion notifies again.
 
-A 5s cooldown per session absorbs queued-message and retry bursts, but errors bypass
-it — a failure must not be swallowed by the cooldown the `busy` transition left
-behind. Restart opencode to load a plugin change; plugins are not hot-reloaded.
+A 5s cooldown per session per outcome absorbs queued-message and retry bursts. Two
+outcomes exempt themselves: **errors**, and **questions** — both report a session that
+is *blocked*, and gating those on a cooldown strands you on a prompt you were never
+told about.
 
-The delivery path is `bin/oc-notify`, the same one `oc` uses, spawned detached so a
-notification can never hold the server open. There is deliberately no second
-implementation of the return trip.
+Delivery goes through `bin/oc-notify`, spawned detached so a notification can never
+hold the server open, and there is deliberately no second implementation of the return
+trip. **`oc-notify`'s exit status is the delivery signal**, and the plugin only logs
+`notified` when it is genuinely zero with empty stderr. That is the check that would
+have caught this section's first two bugs: both produced `message=notified` in the log
+while nothing reached the desktop.
+
+Restart opencode to load a plugin change; plugins are not hot-reloaded. A long-running
+session on a host keeps the old plugin until it is restarted.
 
 **Host details live in `.env`, not in the repo.** The repo is public, so `bin/oc-sync`
 carries no names, addresses or usernames: it reads `OC_HOSTS` (whitespace, comma or

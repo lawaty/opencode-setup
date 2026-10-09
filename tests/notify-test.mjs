@@ -23,7 +23,7 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(message)
 }
 
-const { Notifier, notifyMessage, safeTitle, shouldNotify } = await import(LIB)
+const { Notifier, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
 const { Notify } = await import(PLUGIN)
 
 // ---------------------------------------------------------------------------
@@ -124,6 +124,58 @@ await check("an error notifies at critical urgency", () => {
 await check("a missing session id never notifies", () => {
   assert(!shouldNotify({ info: undefined, outcome: "done" }).notify, "no info, no notification")
   assert(!shouldNotify({ info: {}, outcome: "done" }).notify, "no id, no notification")
+})
+
+// ---------------------------------------------------------------------------
+// Wording: what the reader must do, not what opencode did
+// ---------------------------------------------------------------------------
+
+await check("the two useful outcomes say what they want from you", () => {
+  assert(
+    notifyMessage("done") === "Task finished, waiting for your review",
+    `done should name the review step, got ${JSON.stringify(notifyMessage("done"))}`,
+  )
+  assert(
+    notifyMessage("question") === "Awaiting your response",
+    `question should ask for an answer, got ${JSON.stringify(notifyMessage("question"))}`,
+  )
+  assert(
+    !/session (finished|ended|complete)/i.test(notifyMessage("done")),
+    "the session is still open; 'session finished' overstates it",
+  )
+})
+
+await check("a question names itself so it can be answered without the terminal", () => {
+  assert(
+    notifyMessage("question", "Pick A or B?").includes("Pick A or B?"),
+    "the question text should be included",
+  )
+})
+
+await check("a question is normal urgency, not critical", () => {
+  const decision = shouldNotify({ info: { id: "s1", title: "Deploy" }, outcome: "question" })
+  assert(decision.notify, "a question should notify")
+  assert(decision.urgency === "normal", `a question is routine, got ${decision.urgency}`)
+})
+
+await check("the question headline picks the first real question", () => {
+  assert(questionHeadline([{ question: "Which option?" }]) === "Which option?", "plain question")
+  assert(questionHeadline([{ question: "  " }, { question: "Second?" }]) === "Second?", "skips blank")
+  assert(questionHeadline(undefined) === "", "no questions, no headline")
+  assert(questionHeadline([{ question: "x".repeat(200) }]).length <= 70, "long questions are truncated")
+})
+
+await check("an unanswered question suppresses the redundant 'finished'", () => {
+  const decision = shouldNotify({
+    info: { id: "s1", title: "Deploy" },
+    outcome: "done",
+    sawMessage: true,
+    awaitingResponse: true,
+  })
+  assert(
+    !decision.notify && decision.reason === "awaiting your response",
+    `the idle after a question must not claim the task finished, got ${JSON.stringify(decision)}`,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -261,6 +313,262 @@ await check("the handler notifies for a root session and ignores a child", async
   assert(lines.length === 1, `expected exactly one notification, got ${lines.length}: ${JSON.stringify(lines)}`)
   assert(lines[0].includes("Fix the login redirect"), `notification should name the session: ${lines[0]}`)
   assert(!lines[0].includes("explore-fast"), "the subagent must not appear")
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// question.asked is not in the pinned SDK's event types. The runtime emits it,
+// so the handler must accept it off the wire anyway.
+await check("question.asked notifies and names the question", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const sessions = { root: { id: "root", title: "Fix the login redirect" } }
+  const client = makeClient(sessions)
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({
+    event: {
+      type: "question.asked",
+      properties: {
+        sessionID: "root",
+        questions: [{ question: "Which option should I pick?" }],
+        tool: { messageID: "m1", callID: "c1" },
+      },
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+  assert(lines.length === 1, `expected one notification, got ${lines.length}: ${JSON.stringify(lines)}`)
+  assert(lines[0].includes("Awaiting your response"), `wrong wording: ${lines[0]}`)
+  assert(lines[0].includes("Which option should I pick?"), `the question should be named: ${lines[0]}`)
+  assert(!lines[0].includes("critical"), "a question is not a failure")
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("the idle after a question does not also claim the task finished", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const sessions = { root: { id: "root", title: "Deploy" } }
+  const client = makeClient(sessions)
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = existsSync(sent) ? readFileSync(sent, "utf8").trim().split("\n").filter(Boolean) : []
+  assert(
+    lines.length === 1,
+    `the parked question is one blocked moment, not two notifications: ${JSON.stringify(lines)}`,
+  )
+  assert(!lines[0].includes("Task finished"), `nothing finished while blocked on a question: ${lines[0]}`)
+
+  // Answering releases it: the next real completion must notify again.
+  await hooks.event({ event: { type: "question.replied", properties: { sessionID: "root" } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const after = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(after.length === 2, `the completion after answering should notify, got ${JSON.stringify(after)}`)
+  assert(after[1].includes("Task finished"), `expected the finished wording: ${after[1]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a question clears when the session errors instead", async () => {
+  // An error unblocks the session, so the parked-question suppression must not
+  // survive it -- otherwise the next idle is judged against a stale question.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const sessions = { root: { id: "root", title: "Deploy" } }
+  const client = makeClient(sessions)
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
+  })
+  await hooks.event({ event: { type: "session.error", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(lines.length === 3, `question, error, then the real completion: ${JSON.stringify(lines)}`)
+  assert(lines[2].includes("Task finished"), `the last one is a real completion: ${lines[2]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a failed delivery is logged as a failure, not as notified", async () => {
+  // The bug this guards: oc-notify exits 0 even when the tunnel is unreachable,
+  // and the plugin used to log "notified" regardless. Five notifications were
+  // logged as sent while nothing reached the desktop.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, "#!/usr/bin/env bash\necho 'oc: could not reach the local desktop' >&2\nexit 0\n", {
+    mode: 0o755,
+  })
+
+  const client = makeClient({ root: { id: "root", title: "Remote task" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 800))
+
+  assert(
+    !client.logs.some((line) => line.startsWith("info notified")),
+    `a failed delivery must not be logged as notified: ${JSON.stringify(client.logs)}`,
+  )
+  assert(
+    client.logs.some((line) => line.includes("could not reach")),
+    `the helper's own diagnostic should reach the log: ${JSON.stringify(client.logs)}`,
+  )
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a non-zero helper exit is a failure even with no stderr", async () => {
+  // The hop's real failure is ssh exiting 255 with
+  // "Permission denied (publickey,password)" -- which the tunnel's LogLevel=ERROR
+  // suppresses on some paths, leaving nothing on stderr. Matching stderr text alone
+  // logged that as "notified", which is how a dead tunnel looked healthy.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, "#!/usr/bin/env bash\nexit 255\n", { mode: 0o755 })
+
+  const client = makeClient({ root: { id: "root", title: "Remote task" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 800))
+
+  assert(
+    !client.logs.some((line) => line.startsWith("info notified")),
+    `a silent non-zero exit must not be logged as notified: ${JSON.stringify(client.logs)}`,
+  )
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a second question within the cooldown still notifies", async () => {
+  // Gating questions on the cooldown strands the user: they answer the first one
+  // fast, the model asks the second one a second later, and the session sits
+  // parked on a prompt they were never told about. Same reasoning as the error
+  // bypass -- a blocked session must not be swallowed.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  const ask = (text) =>
+    hooks.event({ event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: text }] } } })
+
+  await ask("First question?")
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  await ask("Second question?")
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(lines.length === 2, `both questions should notify, got ${lines.length}: ${JSON.stringify(lines)}`)
+  assert(lines[1].includes("Second question?"), `the second question must be named: ${lines[1]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("a rejected question stops suppressing later completions", async () => {
+  // Dismissing a question rather than answering it is a real path. If `pending`
+  // survives it, every later "Task finished" for that session is silently
+  // dropped -- the notification stops working for that session entirely.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  await hooks.event({
+    event: { type: "question.rejected", properties: { sessionID: "root", requestID: "que_1" } },
+  })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(lines.length === 2, `the completion after a rejection should notify: ${JSON.stringify(lines)}`)
+  assert(lines[1].includes("Task finished"), `expected the finished wording: ${lines[1]}`)
+
+  delete process.env.OC_NOTIFY_HELPER
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await check("deleting a session clears its parked question and busy marker", async () => {
+  // The in-process maps must not outlive the session, or a deleted session that
+  // had asked a question would keep suppressing anything reusing its id.
+  const dir = mkdtempSync(join(tmpdir(), "notify-"))
+  const sent = join(dir, "sent.log")
+  const helper = join(dir, "oc-notify")
+  writeFileSync(helper, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${sent}\n`, { mode: 0o755 })
+
+  const client = makeClient({ root: { id: "root", title: "Deploy" } })
+  const hooks = await Notify({ client, directory: dir })
+  process.env.OC_NOTIFY_HELPER = helper
+
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await hooks.event({
+    event: { type: "question.asked", properties: { sessionID: "root", questions: [{ question: "A or B?" }] } },
+  })
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "root", title: "Deploy" } } } })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "root", status: { type: "busy" } } } })
+  await new Promise((resolve) => setTimeout(resolve, 5_200))
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+
+  const lines = readFileSync(sent, "utf8").trim().split("\n").filter(Boolean)
+  assert(lines.length === 2, `state must be cleared on delete: ${JSON.stringify(lines)}`)
 
   delete process.env.OC_NOTIFY_HELPER
   rmSync(dir, { recursive: true, force: true })

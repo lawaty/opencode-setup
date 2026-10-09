@@ -16,11 +16,23 @@ const INTERNAL_TITLE_PREFIXES = [
   "context-manager (auto",
 ]
 
-// Title text for the notification body. Kept short on purpose: it is a desktop
-// line, not a report, and the session is named so the user can find it.
-export const notifyMessage = (outcome: "done" | "error", detail?: string) => {
+// The three things worth interrupting someone for. Wording is deliberately about
+// what *they* must do, not about what opencode did: a notification is only
+// actionable if the reader can tell, in one line, whether they are the bottleneck.
+//
+// "Finished" is deliberately not "session finished". The session is still open --
+// this is the agent handing control back, and saying "session ended" implies the
+// work is over and the conversation closed, which is neither true nor useful.
+export const NOTIFY_OUTCOMES = ["done", "question", "error"] as const
+export type Outcome = (typeof NOTIFY_OUTCOMES)[number]
+
+export const notifyMessage = (outcome: Outcome, detail?: string) => {
   if (outcome === "error") return detail ? `Failed — ${detail}` : "Failed"
-  return "Ready for you"
+  // The question's own text is appended when known. It is the difference between a
+  // notification you must open a terminal to act on and one you can answer from
+  // the notification itself, which is the whole reason to interrupt someone.
+  if (outcome === "question") return detail ? `Awaiting your response — ${detail}` : "Awaiting your response"
+  return "Task finished, waiting for your review"
 }
 
 export type SessionInfo = {
@@ -45,10 +57,13 @@ export const safeTitle = (raw: string | undefined, fallback = "session") => {
 // Why a given session transition should not raise a notification.
 export const shouldNotify = (input: {
   info: SessionInfo | undefined
-  outcome: "done" | "error"
+  outcome: Outcome
   detail?: string
   // A session created but never prompted is an empty shell, not finished work.
   sawMessage?: boolean
+  // An unanswered question is outstanding in this session. Suppresses the
+  // redundant "finished" that the idle event raises right after a question.
+  awaitingResponse?: boolean
 }): Decision => {
   const { info, outcome, detail } = input
 
@@ -66,7 +81,7 @@ export const shouldNotify = (input: {
     return { notify: false, reason: "internal session" }
   }
 
-  // Compaction rewrites history and idles the session, but no task finished:
+// Compaction rewrites history and idles the session, but no task finished:
   // the user is still mid-conversation. Sending "ready for you" here would
   // train them to dismiss the notification without reading it.
   if (info.time?.compacting) return { notify: false, reason: "compacting" }
@@ -75,12 +90,33 @@ export const shouldNotify = (input: {
     return { notify: false, reason: "no work done" }
   }
 
+  // A session blocked on a question has already told them. The idle event that
+  // follows the question would otherwise fire a second notification for the same
+  // blocked moment, and "task finished" is actively wrong there -- nothing
+  // finished, the task is parked waiting on them.
+  if (outcome === "done" && input.awaitingResponse) {
+    return { notify: false, reason: "awaiting your response" }
+  }
+
+  // A question is a request for the user, not a failure, so it is not critical:
+  // critical urgency escalates to a modal on most desktops, and this is a routine
+  // part of working with an agent.
   return {
     notify: true,
     title: `opencode — ${title}`,
     message: notifyMessage(outcome, detail),
     urgency: outcome === "error" ? "critical" : "normal",
   }
+}
+
+// A question can span several entries, and the notification should name the one
+// that is actually blocking. Long questions are truncated rather than wrapped:
+// this is a one-line desktop summary, and the full text is in the terminal.
+export const questionHeadline = (questions: Array<{ question?: string }> | undefined) => {
+  const first = questions?.find((entry) => typeof entry?.question === "string" && entry.question.trim())
+  if (!first?.question) return ""
+  const clean = safeTitle(first.question)
+  return clean.length > 70 ? `${clean.slice(0, 69)}…` : clean
 }
 
 // Rate limit. A root session can idle more than once in quick succession (a

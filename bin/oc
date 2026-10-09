@@ -4,9 +4,14 @@ set -uo pipefail
 # oc — start opencode and raise a desktop notification when the session ends.
 #
 # Why a wrapper at all: a session started over ssh on a remote host has no
-# display, so nothing tells you the agent finished. This runs opencode normally
-# and notifies your LOCAL desktop when the session starts, succeeds, or fails.
-# Notification failure never changes opencode's exit code.
+# display, so nothing tells you the agent is blocked or finished. This runs
+# opencode normally and notifies your LOCAL desktop when opencode itself dies.
+#
+# What it does NOT notify: session start, and a clean exit. A turn finishing, or
+# the agent asking a question, is plugins/notify.ts's job -- it knows the session
+# name and the reason, and this script knows neither. Duplicating those here is
+# what produced a "Session finished" notification naming nothing. Notification
+# failure never changes opencode's exit code.
 #
 # The remote -> local hop uses an SSH RemoteForward, so it works with no
 # publicly reachable IP (the usual case behind NAT). oc-sync installs the
@@ -37,7 +42,10 @@ set -uo pipefail
 #                          # send one notification and exit, no opencode
 #
 # Tunables:
-#   OC_TUNNEL_PORT    local port of the reverse tunnel (default 10022)
+#   OC_TUNNEL_PORT    remote port of the reverse tunnel. Normally read from
+#                     ~/.config/opencode/remote.env, which oc-sync writes per host;
+#                     each host has its own port because one port can only belong
+#                     to one tunnel.
 #   OC_LOCAL_USER     your local username, if it differs from the remote one
 #   OC_NOTIFY         0 disables notifications entirely
 #
@@ -48,6 +56,43 @@ TUNNEL_PORT="${OC_TUNNEL_PORT:-10022}"
 LOCAL_USER="${OC_LOCAL_USER:-}"
 ENABLED="${OC_NOTIFY:-1}"
 WARNED=0
+
+# The local desktop username, for any context that did not export it.
+#
+# This lookup exists because OC_LOCAL_USER is written to .bashrc/.profile by
+# oc-sync, and that covers exactly the contexts that read rc files: an
+# interactive ssh, a login shell, tmux started from one. It does NOT cover cron,
+# a systemd unit, `ssh host 'cmd'`, or -- most importantly -- a detached child
+# of an opencode server started before this file existed. In all of those,
+# OC_LOCAL_USER is unset, the fallback below used to be `id -un` == root on these
+# hosts, and the hop failed with "root@localhost: Permission denied
+# (publickey,password)" -- silently, because the receiver is a forced command.
+#
+# So: honour the env var, then a marker file oc-sync writes, then give up and say
+# so. Guessing a username produces a confusing publickey failure; saying the
+# variable is unset points at the actual fix.
+NOTIFY_ENV_FILE="${OC_ENV_FILE:-$HOME/.config/opencode/remote.env}"
+
+# Read one value out of the marker file oc-sync writes. Same reasoning as
+# resolve_local_user: the port is per-host now, so a non-interactive context that
+# cannot see .bashrc would otherwise fall back to the old global 10022 -- which is
+# either another host's listener or nothing at all.
+read_notify_env() {
+  [[ -r "$NOTIFY_ENV_FILE" ]] || return 1
+  local value
+  value="$(sed -n "s/^export $1=\([^#]*\)\$/\1/p" "$NOTIFY_ENV_FILE" 2>/dev/null | head -1 | tr -d "\"'")"
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+  return 0
+}
+
+resolve_local_user() {
+  if [[ -n "$LOCAL_USER" ]]; then
+    printf '%s' "$LOCAL_USER"
+    return 0
+  fi
+  read_notify_env OC_LOCAL_USER
+}
 
 # An icon that actually exists on the local desktop. Anything else here shows up
 # as a generic placeholder, so keep this list to shipped icon-theme names.
@@ -82,6 +127,15 @@ send_notify() {
   local title="${1:-OpenCode}" msg="${2:-}" urgency="${3:-normal}" icon
   icon="$(normalize_icon "${4:-}")"
 
+  # The port is per-host, so it must be resolved from the same place as the user
+  # name. An explicit OC_TUNNEL_PORT still wins.
+  if [[ -z "${OC_TUNNEL_PORT:-}" ]]; then
+    local from_file
+    if from_file="$(read_notify_env OC_TUNNEL_PORT)"; then
+      TUNNEL_PORT="$from_file"
+    fi
+  fi
+
   case "$urgency" in
     low|normal|critical) ;;
     *) urgency=normal ;;
@@ -90,8 +144,14 @@ send_notify() {
   if [[ -n "${SSH_CLIENT:-}" || -n "${SSH_TTY:-}" ]]; then
     # Remote: hop home over the reverse tunnel. The key is scoped by
     # authorized_keys to the notifier only, so this cannot open a shell here.
-    local -a target=()
-    if [[ -n "$LOCAL_USER" ]]; then target=(-p "$TUNNEL_PORT" "${LOCAL_USER}@localhost"); else target=(-p "$TUNNEL_PORT" localhost); fi
+    local hop_user
+    if ! hop_user="$(resolve_local_user)"; then
+      warn_once "OC_LOCAL_USER is unset and could not be read from the marker file."
+      warn_once "  the hop would try to authenticate as $(id -un), which the desktop does not accept."
+      warn_once "  fix: run 'bin/oc-sync' on this host (it writes both), or export OC_LOCAL_USER=<your desktop user>"
+      return 1
+    fi
+    local -a target=(-p "$TUNNEL_PORT" "${hop_user}@localhost")
 
     if [[ -f "$HOME/.ssh/oc_notify" ]]; then
       if ssh "${target[@]}" \
@@ -114,10 +174,12 @@ send_notify() {
     fi
   fi
 
-  warn_once "could not reach the local desktop over tunnel port $TUNNEL_PORT. Common causes:"
-  warn_once "  (a) this is a second concurrent session to the same host -- the first one owns port $TUNNEL_PORT and only one session can hold it"
-  warn_once "  (b) ~/.ssh/config has no 'RemoteForward $TUNNEL_PORT localhost:22' for this host"
-  warn_once "  (c) OC_LOCAL_USER is unset and the local username differs from $(id -un)"
+  # Each of these was a real cause of silence, and the old wording sent people to
+  # look in ~/.ssh/config -- which is no longer where the tunnel lives.
+  warn_once "could not reach the local desktop over tunnel port $TUNNEL_PORT."
+  warn_once "  (a) on the desktop: 'systemctl --user status oc-tunnel@<host>' -- the tunnel is a unit now, not your ssh session"
+  warn_once "  (b) on this host: ~/.config/opencode/remote.env is missing, so the desktop user and port are unknown -- re-run 'bin/oc-sync'"
+  warn_once "  (c) on this host: no tunnel key at ~/.ssh/oc_notify -- re-run 'bin/oc-sync'"
   return 1
 }
 
@@ -125,9 +187,15 @@ send_notify() {
 # oc-notify reuses this file's send_notify via bin/oc-notify, which execs us with
 # OC_NOTIFY_ONLY set. An env var rather than $0: the wrapper has to exec us by
 # absolute path to find us, so the name we were invoked under is not preserved.
+#
+# Unlike the wrapper below, this branch PROPAGATES the failure. plugins/notify.ts
+# spawns oc-notify and has no other way to learn whether a notification arrived:
+# the local end is a forced command, so a failed hop is silent. This exit code is
+# the delivery signal, and swallowing it is what let five notifications be logged
+# as sent while nothing reached the desktop.
 if [[ -n "${OC_NOTIFY_ONLY:-}" ]]; then
-  send_notify "${1:-OpenCode}" "${2:-}" "${3:-normal}" "${4:-}" || true
-  exit 0
+  send_notify "${1:-OpenCode}" "${2:-}" "${3:-normal}" "${4:-}"
+  exit $?
 fi
 
 # Locate the opencode binary.
@@ -162,15 +230,22 @@ if [[ "$ENABLED" != "1" ]]; then
   exec "$OPENCODE_BIN" "$@"
 fi
 
-send_notify "OpenCode" "Starting session..." || true
-
+# No "Starting session..." notification. It interrupts to say nothing: there is no
+# result yet, and no title to name, and a notification the user learns to dismiss
+# on sight is one they will dismiss when it matters. What remains here is only
+# what the wrapper can know and the plugin cannot -- that the process itself is
+# about to die. A turn finishing, or the agent asking something, is the plugin's
+# job: it knows the session name and the reason, this script does not.
+#
+# The success case is therefore not notified from here. `oc` exiting 0 says the
+# process ended, not that your work finished and is ready to review -- and for a
+# long-running interactive session those are different events entirely.
 "$OPENCODE_BIN" "$@"
 EXIT_CODE=$?
 
-if [[ $EXIT_CODE -eq 0 ]]; then
-  send_notify "OpenCode" "Session finished" || true
-else
-  send_notify "OpenCode" "Session exited with code $EXIT_CODE" "critical" || true
+if [[ $EXIT_CODE -ne 0 ]]; then
+  # A crash the plugin never saw: it died before or instead of a session event.
+  send_notify "opencode" "Session exited with code $EXIT_CODE" "critical" || true
 fi
 
 exit $EXIT_CODE

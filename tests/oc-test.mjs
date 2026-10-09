@@ -111,13 +111,54 @@ check("oc uses the dedicated tunnel key, never a personal key", () => {
 })
 
 check("oc's failure message names the real cause", () => {
-  // A tunnel port can fail for three distinct reasons, and "check your config"
-  // sent people looking in the wrong place. The most common one is a second
-  // concurrent session holding the port.
+  // Every line here was a real cause of silence. The wording used to point at
+  // ~/.ssh/config, which is no longer where the tunnel lives -- so the advice
+  // sent people to the wrong file while the actual fault was a systemd unit.
   const src = read("oc")
-  assert(/concurrent session/.test(src), "should mention the concurrent-session collision")
-  assert(/RemoteForward/.test(src), "should mention the missing RemoteForward")
-  assert(/OC_LOCAL_USER/.test(src), "should mention the unset username")
+  assert(/systemctl --user status oc-tunnel@/.test(src), "should point at the tunnel unit on the desktop")
+  assert(/remote\.env/.test(src), "should mention the per-host marker file that carries the port and user")
+  assert(/oc-sync/.test(src), "should say which command repairs it")
+  // Stale advice is worse than none: it is confidently wrong.
+  assert(!/RemoteForward/.test(src.replace(/^\s*#.*$/gm, "")), "the RemoteForward era advice must be gone")
+})
+
+check("the hop resolves the desktop user from a marker file, not just the env", () => {
+  // Regression: OC_LOCAL_USER is exported from .bashrc/.profile, which covers an
+  // interactive ssh and nothing else. The notify plugin invokes oc-notify as a
+  // detached child of an already-running server, so the variable was unset and
+  // the fallback was `id -un` == root -- the hop died with
+  // "root@localhost: Permission denied (publickey,password)" and, because the
+  // receiver is a forced command, said nothing useful about why.
+  const src = read("oc")
+  assert(/read_notify_env|remote\.env/.test(src), "should read a marker file that needs no shell to source")
+  assert(!/LOCAL_USER="\$\{OC_LOCAL_USER:-\$\(id -un\)\}"/.test(src),
+    "must not fall back to id -un: on these hosts that is root, which is never the desktop user")
+  assert(/OC_LOCAL_USER is unset/.test(src),
+    "an unresolvable username should say which variable is missing, not guess")
+})
+
+check("the tunnel port is resolved per host, from the same marker file", () => {
+  // Each host now gets its own listener port, so a context that cannot see the
+  // rc files must still learn its own port. Falling back to the old global 10022
+  // would point at another host's tunnel, or at nothing.
+  const src = read("oc")
+  assert(/read_notify_env OC_TUNNEL_PORT/.test(src), "the port should come from the marker file too")
+})
+
+check("oc no longer notifies on start, and does not duplicate the finished case", () => {
+  // A start notification interrupts to say nothing: no result, no title, nothing
+  // to act on. The success case belongs to the plugin, which knows the session
+  // name and whether work actually finished -- `oc` exiting 0 only means the
+  // process ended.
+  const src = read("oc")
+  // Comments are excluded: the file explains why the start notification is gone,
+  // and the check is about behaviour, not about the absence of a phrase.
+  const code = src.replace(/^\s*#.*$/gm, "")
+  assert(!/Starting session/.test(code), "no notification should fire before opencode runs")
+  assert(!/send_notify "OpenCode" "Session finished"/.test(code),
+    "the finished notification would duplicate the plugin's, without a session name")
+  // The failure case stays: a crash is something the plugin never observed.
+  assert(/Session exited with code/.test(src), "a nonzero exit is still worth a critical notification")
 })
 
 check("warn() exists for multi-line diagnostics", () => {
@@ -230,6 +271,100 @@ check("oc-sync's own ssh calls never claim the tunnel port", () => {
   }
   assert((src.match(/SSH_BASE=\(ssh -n "\$\{SSH_SSH_OPTS\[@\]\}"\)/) || []).length === 1,
     "SSH_BASE should use the shared opts array")
+})
+
+check("oc-sync installs a supervised tunnel unit per host", () => {
+  // Regression: the RemoteForward in ~/.ssh/config belongs to whichever session
+  // logged in first and only exists while that session lives. Observed on
+  // dev-host: the session started at 13:54, the tunnel's owner at 15:19, so
+  // five finished tasks notified a port that did not exist yet.
+  const src = read("oc-sync")
+  assert(/systemd\/user/.test(src), "units should be user units, not system ones")
+  assert(/ExecStart=.*ssh -N/.test(src), "the unit should hold a forward with ssh -N")
+  assert(/Restart=always/.test(src), "a dropped connection must come back on its own")
+  assert(/enable-linger/.test(src), "the tunnel must survive logout, or it depends on a login again")
+  // -o RemoteForward=<port> localhost:22 is parsed by ssh as option plus
+  // hostname, so it fails with "Could not resolve hostname localhost:22".
+  assert(/-R \$port:localhost:22/.test(src), "the forward should use -R, not a split -o value")
+  assert(!/-o RemoteForward=\$port localhost:22/.test(src), "that -o form does not parse")
+})
+
+check("each host gets its own tunnel port, derived stably from its name", () => {
+  // Two hosts sharing one port means only one of them can ever notify.
+  const src = read("oc-sync")
+  assert(/host_tunnel_port/.test(src), "ports should be derived per host")
+  const fn = src.slice(src.indexOf("host_tunnel_port()"), src.indexOf("assert_ports_unique()"))
+  // It must not depend on a counter that changes between runs, or a host's
+  // cached OC_TUNNEL_PORT would point at a different host's listener. The port is
+  // a pure function of the host name.
+  assert(!/\bfor\b.*HOSTS/.test(fn), "the port must not depend on the host list order")
+  assert(/port_hash/.test(fn), "the port should come from a name-derived hash")
+
+  // Two hosts on one port is fatal and quiet: the loser's unit crash-loops on
+  // ExitOnForwardFailure, so only one of them can ever notify.
+  assert(/assert_ports_unique/.test(src), "collisions should be checked before any unit is written")
+  assert(/exit 1/.test(src.slice(src.indexOf("assert_ports_unique()"), src.indexOf("install_tunnel_unit()"))),
+    "a collision should stop the run, not warn and continue")
+})
+
+check("the collision guard actually fires", () => {
+  // Executed, not pattern-matched: an "ab"/"ba" pair really does collide, and a
+  // guard that never triggers is indistinguishable from one that is not wired up.
+  const src = read("oc-sync")
+  const fns = src.slice(src.indexOf("host_tunnel_port()"), src.indexOf("assert_ports_unique()"))
+    + src.slice(src.indexOf("assert_ports_unique()"), src.indexOf("install_tunnel_unit()"))
+  // exit 1 is the expected outcome for the collision case, so the probe reports
+  // through stdout and exits 0 either way.
+  const probe = `
+TUNNEL_BASE_PORT=10022
+${fns}
+ok() { echo "ok:$*"; }
+warn() { echo "warn:$*"; }
+bad() { echo "err:$*"; }
+ONLY_HOST=""
+HOSTS=(ab ba)
+( assert_ports_unique ) && echo "collide=passed" || echo "collide=stopped"
+HOSTS=(ab cd)
+( assert_ports_unique ) && echo "distinct=passed" || echo "distinct=stopped"
+exit 0
+`
+  const out = execFileSync("bash", ["-c", probe], { encoding: "utf8" })
+  assert(/collide=stopped/.test(out), `a real collision must stop the run: ${out}`)
+  assert(/claimed by both/.test(out), `and must say which two hosts: ${out}`)
+  assert(/distinct=passed/.test(out), `distinct hosts must pass: ${out}`)
+})
+
+check("oc-sync removes the RemoteForward that used to race the unit", () => {
+  // Left in place, the config line wins the port on every login and then drops
+  // the tunnel the moment that terminal closes -- which is the original bug.
+  const src = read("oc-sync")
+  assert(/drop_config_remoteforward/.test(src), "the config lines should be removed")
+  assert(/ocsync-backup/.test(src), "editing a file outside the repo needs a backup to be recoverable")
+})
+
+check("oc-sync's env marker is written with an absolute path and read back", () => {
+  // Shipped bug: ENV_PATH was "~/.config/opencode/remote.env" inside double
+  // quotes, so the shell created a literal directory named "~" on both hosts and
+  // the run still printed success. The redirect returning 0 proves nothing.
+  const src = read("oc-sync")
+  assert(/ENV_PATH="\$HOME\/\.config\/opencode\/remote\.env"/.test(src),
+    "the path must expand $HOME, not a quoted tilde")
+  assert(/grep -q "\^export OC_LOCAL_USER="/.test(src), "the file must be verified after writing")
+})
+
+check("oc-notify propagates a failed delivery as its exit status", () => {
+  // Regression: this branch ended in `|| true; exit 0`, so plugins/notify.ts had no
+  // signal at all -- it logged "notified" on every delivery, which is how five
+  // notifications were reported as sent while nothing reached the desktop.
+  const src = read("oc")
+  const branch = src.slice(src.indexOf('if [[ -n "${OC_NOTIFY_ONLY:-}" ]]'), src.indexOf("resolve_opencode()"))
+  assert(/exit \$\?/.test(branch), "oc-notify must exit with send_notify's status")
+  assert(!/\|\| true/.test(branch), "the failure must not be swallowed here")
+  // The wrapper's own crash path keeps its old contract: a notification failure
+  // never changes opencode's exit code.
+  const wrapper = src.slice(src.indexOf("resolve_opencode()"))
+  assert(/Session exited with code/.test(wrapper.replace(/^\s*#.*$/gm, "")),
+    "a nonzero opencode exit is still notified")
 })
 
 check("oc-sync repairs a stale authorized_keys receiver path", () => {

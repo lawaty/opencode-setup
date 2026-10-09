@@ -115,8 +115,9 @@ routing reads every sibling file. Cooldowns are one file per model for the same 
 ```
 opencode.jsonc            agents, permissions, provider whitelists (no pool models)
 AGENTS.md                 global instructions, auto-loaded into every session
-bin/oc, bin/oc-notify     launcher (wraps opencode, notifies the local desktop) and a
-                          single-notification helper
+bin/oc, bin/oc-notify     launcher (wraps opencode, notifies the local desktop when it
+                          dies) and a single-notification helper whose exit status is
+                          the delivery signal
 bin/oc-notify-receiver    the forced command a remote may run through the SSH tunnel;
                           installed to ~/.local/bin, never run from the repo
 bin/oc-sync               deploy script; pushes oc, the tunnel key and the whole
@@ -127,8 +128,9 @@ lib/writer-rule.ts        startup check that the one-writer permission rule fire
 plugins/agent-pool.ts     hooks: task routing, limit detection, hang reaper, pool_status
 plugins/context-autoupdate.ts
                           keeps .opencode/context/ current; borrows a pool slot
-plugins/notify.ts         desktop notification when a root session finishes;
-                          subagents and the cartographer are suppressed
+plugins/notify.ts         desktop notification when a root session needs you -- a turn
+                          finished, or it is blocked on a question. Subagents and the
+                          cartographer are suppressed
 lib/notify.ts             the notification policy, pure and testable
 pool-models.json          the pool's models and weights -- the file you edit
 rules/browser.md          Playwright anti-loop rules, loaded via `instructions`
@@ -203,8 +205,10 @@ owns the list, the config hook derives everything else from it, and the tests fa
 - **Day-to-day reference: [OPERATIONS.md](OPERATIONS.md)** — health checks, restart
   rules, deploying to the other hosts, the context map, and what is not under version control.
 - **Plugins are not hot-reloaded.** Every change here needs a restart of each running
-  opencode process. There is no systemd unit or tmux session — they are foreground
-  processes, so restart each in its own terminal.
+  opencode process. opencode itself is a foreground process with no unit — restart each
+  in its own terminal. The only systemd units are the notify tunnels
+  (`oc-tunnel@<host>`, see OPERATIONS.md), which exist precisely so notifications do
+  *not* depend on a login session.
 - `auth.json` lives in `~/.local/share/opencode/`, **not** in this repo.
 - `@opencode-ai/plugin` is pinned to the opencode binary's own version (**1.18.34**) so the
   SDK and the runtime agree; a mismatch is silent, since only `tool()` is called at runtime
@@ -212,6 +216,10 @@ owns the list, the config hook derives everything else from it, and the tests fa
   assuming parity.
 - `bin/oc-sync` distributes this setup to remote hosts, config included by default
   (`--scripts-only` opts out). It pushes `oc`, `oc-notify`, a dedicated SSH tunnel key,
+  installs one `oc-tunnel@<host>` systemd --user unit per host with its own tunnel port,
+  removes the `RemoteForward` lines that used to make the tunnel depend on which
+  terminal connected first, and writes `~/.config/opencode/remote.env` on each host so
+  non-interactive contexts know the desktop user and port without sourcing an rc file. It
   and `opencode.jsonc`, `pool-models.json`, `lib/`, `plugins/`, `.opencode/`, `AGENTS.md`,
   `commands/` and `rules/` — all but `.opencode/context/`, the derived map each host
   rebuilds for itself. The default used to be scripts-only, which silently left every host

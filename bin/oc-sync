@@ -169,6 +169,172 @@ TUNNEL_KEY="$HOME/.ssh/oc_notify"
 RECEIVER="$HOME/.local/bin/oc-notify-receiver"
 RECEIVER_SRC="$SCRIPT_DIR/oc-notify-receiver"
 
+# ---------------------------------------------------------------------------
+# Persistent tunnel service, one per host.
+#
+# The RemoteForward in ~/.ssh/config belongs to whichever ssh session happens to
+# claim it, and that is a race: every connection to the host tries port 10022,
+# the first one wins, and the loser prints "remote port forwarding failed". Worse,
+# the listener only exists while that particular session is alive. A long opencode
+# session routinely outlives it -- observed on dev-host, where the session
+# started at 13:54 and the tunnel's owner at 15:19, so five finished tasks
+# notified a port that did not exist yet. Silent, because the receiver is a forced
+# command that simply had nothing listening.
+#
+# So the forward becomes a supervised unit instead of a side effect of logging in:
+# systemd --user keeps it up, restarts it, and brings it back after a reboot. Each
+# host gets its OWN port so two hosts cannot fight over one, and the RemoteForward
+# lines in ~/.ssh/config are no longer load-bearing for notifications.
+# ---------------------------------------------------------------------------
+TUNNEL_UNIT_DIR="$HOME/.config/systemd/user"
+TUNNEL_BASE_PORT="${OC_TUNNEL_BASE_PORT:-10022}"
+
+# Stable per-host port: the same host must keep the same port across syncs, or a
+# remote's cached OC_TUNNEL_PORT would point at another host's listener.
+host_tunnel_port() {
+  local host="$1"
+  printf '%s' "$(( TUNNEL_BASE_PORT + $(port_hash "$host") % 64 ))"
+}
+
+# Character-sum hash. Not security, just spreading: hosts get ports spread over
+# 64 values rather than clustered, and the result depends only on the name, so a
+# host's port is stable across runs. A run-time counter would be wrong -- a host
+# moved by an edit to .env would then get a different port, and the OC_TUNNEL_PORT
+# already cached on the host would point at another host's listener.
+port_hash() {
+  local s="$1" sum=0
+  while [[ -n "$s" ]]; do
+    sum=$(( sum + $(printf '%d' "'${s:0:1}") ))
+    s="${s:1}"
+  done
+  printf '%s' "$sum"
+}
+
+# Two hosts on the same port is silent and fatal: the loser's unit crash-loops on
+# ExitOnForwardFailure, so only one of them can ever notify, and the log to prove it
+# is a systemd journal nobody reads. Checked up front rather than discovered later.
+assert_ports_unique() {
+  local host port seen
+  declare -A owner=()
+  local collisions=0
+  for host in "${HOSTS[@]}"; do
+    host="${host//[[:space:]]/}"
+    [[ -z "$host" || "$host" == \#* ]] && continue
+    [[ -n "$ONLY_HOST" && "$host" != "$ONLY_HOST" ]] && continue
+    port="$(host_tunnel_port "$host")"
+    if [[ -n "${owner[$port]:-}" ]]; then
+      warn "tunnel port $port is claimed by both '${owner[$port]}' and '$host' -- '$host' will not be able to notify"
+      collisions=$(( collisions + 1 ))
+    else
+      owner[$port]="$host"
+    fi
+  done
+  if [[ $collisions -gt 0 ]]; then
+    bad "$collisions tunnel port collision(s); set OC_TUNNEL_BASE_PORT to a different base and re-run"
+    exit 1
+  fi
+}
+
+install_tunnel_unit() {
+  local host="$1" port="$2" unit="oc-tunnel@$1"
+  local unit_file="$TUNNEL_UNIT_DIR/$unit.service"
+
+  local rendered
+  rendered="$(cat <<UNIT
+[Unit]
+Description=oc-notify tunnel to $host
+# The desktop may still be coming up; do not fail the unit on a refused
+# connection, just retry.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# -R as its own flag, not -o RemoteForward=...: ssh splits an -o value on
+# whitespace, so "RemoteForward=$port localhost:22" parses the destination as the
+# hostname and fails with "Could not resolve hostname localhost:22".
+#
+# ClearAllForwardings is NOT used here: this process exists to hold a forward.
+# The RemoteForward lines in ~/.ssh/config are dropped by oc-sync instead, because
+# leaving them in is what made every login race this unit for the same port.
+ExecStart=/usr/bin/ssh -N -T -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R $port:localhost:22 $host
+Restart=always
+RestartSec=10
+# Nothing to keep alive locally: this process exists only to hold the forward.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+UNIT
+)"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    ok "[dry-run] would install $unit_file (port $port)"
+    return 0
+  fi
+
+  if ! mkdir -p "$TUNNEL_UNIT_DIR"; then
+    bad "could not create $TUNNEL_UNIT_DIR"
+    return 1
+  fi
+
+  if [[ ! -f "$unit_file" ]] || ! grep -qF -- "-R $port:localhost:22 $host" "$unit_file" \
+     || ! grep -qF "Restart=always" "$unit_file"; then
+    if printf '%s\n' "$rendered" > "$unit_file"; then
+      ok "wrote $unit_file (host port $port)"
+    else
+      bad "could not write $unit_file"
+      return 1
+    fi
+  else
+    ok "$unit already up to date (port $port)"
+  fi
+
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  # Linger lets the unit keep running with no login session, which is the whole
+  # point: the tunnel must not depend on you being logged in interactively.
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+
+  if systemctl --user enable --now "$unit" >/dev/null 2>&1; then
+    ok "oc-tunnel@$host enabled and started (port $port)"
+  else
+    warn "could not start $unit -- run 'systemctl --user status $unit' to see why"
+  fi
+}
+
+drop_config_remoteforward() {
+  # A RemoteForward in ~/.ssh/config is claimed by whichever session connects
+  # first, and every later one loses it -- while the first one holds it only as
+  # long as that terminal is open. The systemd units now own the forwards, so the
+  # config lines are removed: left in place they would keep winning the race and
+  # then dropping the tunnel the moment you closed the terminal that won it.
+  local config="$HOME/.ssh/config"
+  [[ -f "$config" ]] || return 0
+
+  if ! grep -qE '^[[:space:]]*RemoteForward[[:space:]]' "$config"; then
+    ok "no RemoteForward in ~/.ssh/config"
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    ok "[dry-run] would remove RemoteForward lines from ~/.ssh/config"
+    return 0
+  fi
+
+  local backup="$config.ocsync-backup"
+  local tmp="$config.ocsync.$$"
+  # Back up first: this edits a file that is not ours and is not in the repo, so
+  # a mistake here is only recoverable if a copy exists.
+  cp "$config" "$backup" 2>/dev/null || true
+  if grep -vE '^[[:space:]]*RemoteForward[[:space:]]' "$config" > "$tmp" 2>/dev/null && mv "$tmp" "$config"; then
+    ok "removed RemoteForward from ~/.ssh/config (backup: $backup)"
+  else
+    rm -f "$tmp"
+    warn "could not remove RemoteForward from ~/.ssh/config; the tunnel unit may lose the port to a login session"
+  fi
+}
+
 setup_tunnel_auth() {
   if [[ ! -f "$TUNNEL_KEY" ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -238,6 +404,7 @@ setup_tunnel_auth() {
 
 setup_tunnel_auth
 TUNNEL_AUTH_FAILED=$?
+drop_config_remoteforward
 
 [[ -f "$OC_SCRIPT" ]] || { echo "Error: $OC_SCRIPT not found (set OC_SCRIPT to the oc helper)." >&2; exit 1; }
 if [[ $WITH_CONFIG -eq 1 && ! -f "$CONFIG_DIR/opencode.jsonc" ]]; then
@@ -249,12 +416,14 @@ fi
 # and set OC_LOCAL_USER. Prints "oc-sync|..." lines the caller renders.
 remote_prepare() {
   local host="$1"
-  timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s -- "$LOCAL_USER" "$DRY_RUN" <<'REMOTE'
+  timeout "$SSH_TIMEOUT" "${SSH_STDIN[@]}" "$host" bash -s -- "$LOCAL_USER" "$DRY_RUN" "$(host_tunnel_port "$host")" <<'REMOTE'
 set -u
 LOCAL_USER="$1"
 # 1 = preview only: every mutation below is reported instead of performed, so
 # that "nothing was written" is true of the remote host too.
 DRY="$2"
+# This host's own tunnel port, from the unit oc-sync just installed for it.
+HOST_TUNNEL_PORT="$3"
 emit() { echo "oc-sync|$1"; }
 # add_line <rc-file> <exact-line> <what>
 add_line() {
@@ -282,6 +451,45 @@ case ":${PATH}:" in
 esac
 OC_LINE="export OC_LOCAL_USER=${LOCAL_USER}"
 for RC in .bashrc .profile; do add_line "$RC" "$OC_LINE" "OC_LOCAL_USER=${LOCAL_USER}"; done
+
+# This host's tunnel port. Hardcoding 10022 was correct while every host shared
+# one listener, but a dedicated per-host port means the remote must be told which
+# one, in every context -- rc files and the marker file both.
+PORT_LINE="export OC_TUNNEL_PORT=${HOST_TUNNEL_PORT}"
+for RC in .bashrc .profile; do add_line "$RC" "$PORT_LINE" "OC_TUNNEL_PORT=${HOST_TUNNEL_PORT}"; done
+
+# The rc-file export only covers contexts that read rc files: an interactive ssh,
+# a login shell, tmux started from one. It does NOT cover cron, a systemd unit,
+# `ssh host 'cmd'`, or a detached child of a server that was started before the
+# line existed -- which is exactly how plugins/notify.ts invokes oc-notify. In
+# those contexts OC_LOCAL_USER is unset and the hop authenticated as root and
+# failed with a publickey error that named neither the cause nor the fix.
+#
+# So write a plain marker file too, which needs no shell to be sourced. oc reads
+# it as a fallback, and it is regenerated by every sync so it cannot drift.
+# Absolute paths, not "~/...": a tilde inside quotes is not expanded by the
+# shell, so writing to "~/.config/opencode/remote.env" would create a literal
+# directory named "~" and report success. The check below is why that would have
+# shipped silently -- the emit line only proved the redirect returned 0.
+ENV_DIR='mkdir -p "$HOME/.config/opencode"'
+ENV_PATH="$HOME/.config/opencode/remote.env"
+ENV_BODY="export OC_LOCAL_USER=${LOCAL_USER}
+export OC_TUNNEL_PORT=${HOST_TUNNEL_PORT}"
+if [ "$DRY" = "1" ]; then
+  emit "ok:[dry-run] would write OC_LOCAL_USER/OC_TUNNEL_PORT to ${ENV_PATH}"
+elif { $ENV_DIR && printf '%s\n' "$ENV_BODY" > "$ENV_PATH"; } 2>/dev/null; then
+  chmod 600 "$ENV_PATH" 2>/dev/null
+  # Verify by reading it back. A redirect returning 0 only proves the file was
+  # created -- the previous version of this wrote to a literal "~" directory and
+  # still reported success, because the emit never checked the path.
+  if grep -q "^export OC_LOCAL_USER=" "$ENV_PATH" 2>/dev/null; then
+    emit "ok:notify env marker written to ${ENV_PATH} (user=${LOCAL_USER} port=${HOST_TUNNEL_PORT})"
+  else
+    emit "err:marker file ${ENV_PATH} did not verify; non-interactive hops will fail"
+  fi
+else
+  emit "warn:could not write ${ENV_PATH}; non-interactive hops will not know your desktop user"
+fi
 REMOTE
 }
 
@@ -454,6 +662,10 @@ sync_auth() {
   fi
 }
 
+# Before any unit is written: a port collision is only detectable with every
+# host's port in hand, and by then one unit may already be running.
+assert_ports_unique
+
 for HOST in "${HOSTS[@]}"; do
   HOST="${HOST%$'\r'}"
   stripped="${HOST//[[:space:]]/}"
@@ -461,6 +673,8 @@ for HOST in "${HOSTS[@]}"; do
   [[ -n "$ONLY_HOST" && "$HOST" != "$ONLY_HOST" ]] && continue
 
   echo "━━━ Syncing to $HOST ━━━"
+
+  HOST_PORT="$(host_tunnel_port "$HOST")"
 
   PREP="$(remote_prepare "$HOST")"
   if [[ -z "$PREP" ]]; then
@@ -481,6 +695,10 @@ for HOST in "${HOSTS[@]}"; do
   if [[ " ${FAILED[*]-} " == *" $HOST "* ]]; then
     continue
   fi
+
+  # The persistent forward. Installed after the key is in place so the unit is
+  # never left retrying against a host whose receiver is not ready.
+  install_tunnel_unit "$HOST" "$HOST_PORT" || warn "tunnel unit for $HOST not installed -- notifications from it will be unreliable"
 
   if [[ $DRY_RUN -eq 1 ]]; then
     ok "[dry-run] would rsync oc, oc-notify -> ~/bin/"
