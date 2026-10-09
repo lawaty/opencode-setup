@@ -6,6 +6,57 @@
     "explore": { "disable": true },
     "general": { "disable": true },
     "implement": { "disable": true },
+    "build": {
+      "description": "Default root agent. Never explores the codebase itself: read/glob/grep/list/webfetch/websearch are denied, so every investigation goes to @explore-fast and every code change to @implement-fast. Keeps edit/write/bash for applying what comes back and verifying it.",
+      "mode": "primary",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/build.txt}",
+      "permission": {
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "edit": "allow",
+        "write": "allow",
+        "bash": "allow",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-fast*": "allow",
+          "implement-fast*": "allow"
+        }
+      }
+    },
+    "plan": {
+      "description": "Read-only planner. Identical to @basic: it cannot read, grep, glob, list or run commands, so all investigation is delegated to @explore-fast. Produce a plan; do not edit.",
+      "mode": "primary",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/prompts/plan.txt}",
+      "permission": {
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "edit": {
+          "*": "deny",
+          ".opencode/plans/*.md": "allow",
+          "*/.opencode/plans/*.md": "allow",
+          "../../.local/share/opencode/plans/*.md": "allow"
+        },
+        "write": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "question": "allow",
+        "task": {
+          "*": "deny",
+          "explore-fast*": "allow",
+          "implement-fast*": "allow"
+        }
+      }
+    },
     "basic": {
       "model": "opencode-go/deepseek-v4-flash",
       "description": "Default thinking agent. Read-only by design: it may only delegate to explore-fast* / implement-fast* and ask questions. expert is deliberately NOT spawnable from here (root sessions only), so do not promise that escalation.",
