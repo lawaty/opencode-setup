@@ -685,8 +685,16 @@ missing). Never paste context file contents into the report.`,
       "glob": "deny",
       "grep": "deny",
       "list": "deny",
-      "edit": "allow",
-      "write": "allow",
+      "edit": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
+      "write": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
       "bash": "allow",
       "webfetch": "deny",
       "websearch": "deny",
@@ -1006,8 +1014,16 @@ you escalate so @implement-deep can decide whether to explore first.`,
       "glob": "allow",
       "grep": "allow",
       "list": "allow",
-      "edit": "allow",
-      "write": "allow",
+      "edit": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
+      "write": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
       "bash": "allow",
       "webfetch": "allow",
       "websearch": "allow",
@@ -1081,8 +1097,16 @@ trying to explore yourself.`,
       "glob": "allow",
       "grep": "allow",
       "list": "allow",
-      "edit": "allow",
-      "write": "allow",
+      "edit": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
+      "write": {
+        "*": "allow",
+        "*/.opencode/context/**": "deny",
+        ".opencode/context/**": "deny"
+      },
       "bash": "allow",
       "webfetch": "allow",
       "websearch": "allow",

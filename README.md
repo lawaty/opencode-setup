@@ -136,7 +136,35 @@ in [docs/CONTEXT.md](docs/CONTEXT.md).
 
 The mechanism is specific and small: bulk exploration, implementation and
 repository cartography run on pooled cheap or free subagents instead of the main
-model, so the main model's tokens are spent on design work rather than on grep.
+model. There are **two separate effects** here, and they are worth telling apart
+because only one of them is about money per token:
+
+1. **The tokens are spent on a cheaper model.** A read, a grep, or a mechanical
+   edit performed by a near-free subagent costs per-token approximately nothing,
+   where the same call on your main model does not. This is the effect people
+   usually mean when they say the pool saves money.
+2. **The main model's context is never filled with file contents it does not
+   need.** A delegated explorer returns a conclusion and a `file:line`, not
+   forty tool calls' worth of source. The expensive model spends its attention
+   on design work instead of on reconstructing a directory tree, and its context
+   window — a hard, non-renewable budget — is spent on reasoning rather than on
+   raw file text.
+
+The second is the larger of the two, and it is not a cost-per-token effect at
+all: it is a capacity effect. It holds even when the pooled model is not free,
+and it is why the pool is scoped to *mechanical* work. Work that needs real
+judgement belongs to the main model regardless of what the pool is running,
+because pulling a difficult conclusion back through a subagent costs more
+context on the far side than reading the file directly would have.
+
+That scoping is why the bundled preset is free: pooled work is work you would
+not have wanted the main model to do anyway. **Free is the shipped default and
+the documented policy — accepting any model list is a deliberate override, not
+a supported alternative to it.** Nothing rejects a priced model, because a
+user may have priced one in on purpose (US-7), but when the pinned snapshot can
+price a slot the plugin says so once at startup, and it never says so about a
+model it cannot price, because this project does not guess prices.
+
 Agents start from the maintained context map above rather than exploring cold, so
 the structure of your codebase is written down once instead of re-derived on
 every task. Load is counted per model across every agent type and every process,
@@ -180,7 +208,7 @@ open are in [docs/TUNNEL.md](docs/TUNNEL.md).
 
 ## User stories
 
-Twenty-two stories across seven epics, each written as a behavioural contract
+Twenty-three stories across seven epics, each written as a behavioural contract
 with acceptance criteria a test can assert mechanically — the pains behind them,
 the Given/When/Then criteria, and the story-to-test mapping are in
 [docs/USER-STORIES.md](docs/USER-STORIES.md).

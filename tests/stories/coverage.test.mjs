@@ -41,32 +41,79 @@ const definedStories = () => {
 }
 
 /**
- * Strip comments, and mask the BODY of every string literal.
+ * Strip comments, and mask the BODY of every string, template and regex literal.
  *
- * Both are needed, and getting either wrong makes the guard lie:
+ * All three are needed, and getting any of them wrong makes the guard lie:
  *
  *   * Without comment stripping, `// test("[US-15] …")` still matches, so
  *     commenting out a test leaves its story looking covered.
  *   * Without string masking, a string that merely *mentions* a test call —
  *     including one inside this file's own fixtures — is counted as a real
  *     declaration.
+ *   * Without regex masking, a regex literal as ordinary as `/["'`]/` feeds a
+ *     stray quote to the string scanner and desyncs it from there on. The
+ *     symptom that exposed this was a false FAILURE (every test after the regex
+ *     read as absent), but the same desync is worse in the other direction: it
+ *     can *reveal* a `test("[US-N] …")` that lives inside a template or comment
+ *     body, inventing coverage for a story no test declares.
  *
- * Both holes were found by trying to break the guard rather than by reading it.
+ * Each hole was found by trying to break the guard rather than by reading it.
  *
  * The masked copy keeps every index aligned with the plain copy, so a match
  * found in the masked text can be read verbatim out of the plain one.
+ *
+ * Telling a regex literal from a division operator is the hard part, because
+ * both begin with `/`. The rule used here is the one every JS lexer uses: a `/`
+ * opens a regex unless the previous significant token ended an expression — an
+ * identifier/number (except a few keywords), a string/template/regex, or `)`/`]`.
+ * That is enough because a regex is only ever legal where an expression may
+ * begin, and everything else (`=`, `(`, `,`, `:`, `;`, `{`, `}`, operators, …)
+ * allows one.
  */
 const scan = (source) => {
   let plain = ""
   let masked = ""
   let i = 0
+
+  // The last significant token outside a comment/string/regex, categorised so a
+  // bare `/` can be classified. `lastWord` is the identifier/number text when
+  // state is "word", because `return /re/` ends in a word but permits a regex.
+  let state = "start" // "start" | "op" | "word" | "end"
+  let lastWord = ""
+
+  const isWordChar = (c) => /[A-Za-z0-9_$]/.test(c)
+
+  // Keywords that read as identifiers but after which an expression (and thus a
+  // regex literal) may still begin.
+  const REGEX_AFTER_WORD = new Set([
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    "throw", "case", "do", "else", "yield", "await",
+  ])
+
+  const regexAllowed = () => {
+    if (state === "start" || state === "op") return true
+    if (state === "end") return false
+    // state === "word": a number never opens a regex; a keyword might.
+    return !/^[0-9]/.test(lastWord) && REGEX_AFTER_WORD.has(lastWord)
+  }
+
+  // Copy an escape sequence verbatim into plain, masked out of masked.
+  const copyEscape = () => {
+    const two = source[i + 1] !== undefined
+    plain += source[i] + (two ? source[i + 1] : "")
+    masked += "\u0000".repeat(two ? 2 : 1)
+    i += two ? 2 : 1
+  }
+
   while (i < source.length) {
     const ch = source[i]
     const next = source[i + 1]
+
     if (ch === "/" && next === "/") {
       while (i < source.length && source[i] !== "\n") i++
       continue
     }
+
     if (ch === "/" && next === "*") {
       i += 2
       while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++
@@ -76,6 +123,43 @@ const scan = (source) => {
       masked += "\n"
       continue
     }
+
+    if (ch === "/" && regexAllowed()) {
+      plain += ch
+      masked += ch
+      i++
+      let inClass = false
+      while (i < source.length) {
+        const c = source[i]
+        // A regex literal cannot span a line: bail out and let the `/` stand as
+        // an ordinary character rather than swallow the rest of the file.
+        if (c === "\n") break
+        if (c === "\\") {
+          copyEscape()
+          continue
+        }
+        if (c === "[") inClass = true
+        else if (c === "]") inClass = false
+        if (c === "/" && !inClass) {
+          plain += c
+          masked += c
+          i++
+          break
+        }
+        plain += c
+        masked += "\u0000"
+        i++
+      }
+      while (i < source.length && isWordChar(source[i])) {
+        plain += source[i]
+        masked += source[i]
+        i++
+      }
+      state = "end"
+      lastWord = ""
+      continue
+    }
+
     if (ch === '"' || ch === "'" || ch === "`") {
       const quote = ch
       plain += ch
@@ -83,9 +167,7 @@ const scan = (source) => {
       i++
       while (i < source.length) {
         if (source[i] === "\\") {
-          plain += source[i] + (source[i + 1] ?? "")
-          masked += "\u0000".repeat(1 + (source[i + 1] ? 1 : 0))
-          i += 2
+          copyEscape()
           continue
         }
         plain += source[i]
@@ -96,10 +178,36 @@ const scan = (source) => {
         }
         i++
       }
+      state = "end"
+      lastWord = ""
       continue
     }
+
+    if (isWordChar(ch)) {
+      let word = ""
+      while (i < source.length && isWordChar(source[i])) {
+        plain += source[i]
+        masked += source[i]
+        word += source[i]
+        i++
+      }
+      lastWord = word
+      state = "word"
+      continue
+    }
+
     plain += ch
     masked += ch
+    if (/\s/.test(ch)) {
+      // Whitespace is not significant: leave the previous token in place.
+    } else if (ch === ")" || ch === "]") {
+      // These close an expression, so a following `/` is division.
+      state = "end"
+      lastWord = ""
+    } else {
+      state = "op"
+      lastWord = ""
+    }
     i++
   }
   return { plain, masked }
@@ -196,6 +304,43 @@ test("[coverage] a comment or a quoted mention is not a test", () => {
   ].join("\n")
   const found = declarations(fixture).map((d) => d.name)
   assert.deepEqual(found, ["[US-4] real"], `only a real call site counts, got ${JSON.stringify(found)}`)
+})
+
+test("[coverage] a regex literal with quotes inside cannot hide the tests after it", () => {
+  // The exact shipped bug: `/["'`]/` (and friends) fed the string scanner a
+  // stray quote and desynced it, so a file with four passing [US-23] tests was
+  // reported as having zero. Regex bodies must be masked like string bodies, and
+  // a `/` that is division rather than a regex must not start a literal.
+  const fixture = [
+    'const QUOTES = /["\'`]/g',
+    "const PATH = /^a\\/b$/",
+    "const half = total / 2",
+    'test("[US-1] first after the regex")',
+    'test("[US-2] second, still after the regex, and got ${x}")',
+  ].join("\n")
+  const found = declarations(fixture).map((d) => d.name)
+  assert.deepEqual(
+    found,
+    ["[US-1] first after the regex", "[US-2] second, still after the regex, and got ${x}"],
+    `every real test after a regex literal must be found, got ${JSON.stringify(found)}`,
+  )
+})
+
+test("[coverage] no [US-N] marker is invented from a template, string or comment body", () => {
+  // The dangerous direction. A regex literal can desync the scanner so that the
+  // *body* of a template (or a comment) is read as live code, fabricating a
+  // `test("[US-N] …")` for a story that has no real test. That would let a
+  // genuinely untested story pass the guard.
+  const fixture = [
+    "const RE = /`/",
+    'const fake = `text test("[US-99] fabricated") text`',
+    'const alsofake = `${"test(\"[US-98] fabricated\")"} text`',
+    '// test("[US-97] commented out"',
+    "/* test(\"[US-96] block commented out\" */",
+    'test("[US-1] the only real one")',
+  ].join("\n")
+  const found = declarations(fixture).map((d) => d.name)
+  assert.deepEqual(found, ["[US-1] the only real one"], `only the real declaration may exist, got ${JSON.stringify(found)}`)
 })
 
 test("[coverage] every test name that claims a story carries the id in brackets", () => {

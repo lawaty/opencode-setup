@@ -44,8 +44,15 @@ const MAP_FILE = ".opencode/context/architecture.md"
 // ---------------------------------------------------------------------------
 // A permission evaluator, copied from opencode's semantics as documented in
 // src/lib/writer-rule.ts: patterns compile to ANCHORED regexes (* -> .*), the
-// LONGEST matching pattern wins, and a plain string is the verdict outright.
+// LAST matching rule wins (there is no specificity sorting — it is a findLast
+// over the flattened entries), and a plain string is the verdict outright.
 // Asserting on rule *strings* would pass for a rule that matches nothing.
+//
+// The "last match wins" half is load-bearing rather than pedantic: it is why
+// every narrow deny in this package is declared LAST. An evaluator that ranked
+// by pattern length would happily accept a deny sitting above a blanket
+// `"*": "allow"` — a table opencode would in fact resolve the other way, and
+// which would therefore leave the map writable by every implement tier.
 // ---------------------------------------------------------------------------
 
 const patternMatches = (pattern, file) => {
@@ -60,13 +67,12 @@ const patternMatches = (pattern, file) => {
 const verdict = (rule, file) => {
   if (rule === undefined) return "allow" // an unconfigured tool is not restricted
   if (typeof rule === "string") return rule
-  let best
+  // findLast: every matching entry overwrites the verdict, so the last one wins.
+  let winner = rule["*"] ?? "allow" // opencode's own fallback when nothing matches
   for (const [pattern, value] of Object.entries(rule)) {
-    if (!patternMatches(pattern, file)) continue
-    if (best === undefined || pattern.length > best.pattern.length) best = { pattern, value }
+    if (patternMatches(pattern, file)) winner = value
   }
-  if (best === undefined) return rule["*"] ?? "allow"
-  return best.value
+  return winner
 }
 
 /** Could this agent write inside the codemap at all? */
@@ -421,23 +427,23 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
 
   // Evaluated, not string-matched: a rule can name the map and still never fire.
   //
-  // "Granted by rule" is the exact claim, and it is narrower than it looks.
-  // `build`, `implement-fast` and `implement-deep` hold a blanket
-  // `"edit": "allow"`, so opencode does not stop THEM from touching the map —
-  // what stops them is the standing rule telling every agent never to edit it
-  // (asserted separately below). That is how this package ships today, in
-  // opencode.jsonc as well as here, and a test claiming otherwise would be
-  // asserting a permission table nobody wrote.
+  // "Granted by rule" is the exact claim, and it is narrower than it looks — an
+  // agent holding a blanket `"edit": "allow"` is also granted the map, just not
+  // BY a rule. So the claim is checked two ways below: only context-manager has a
+  // grant rule, AND no other agent can reach the map at all.
   const granted = Object.entries(cfg.agent)
     .filter(([, def]) => !def.hidden)
     .filter(([, def]) => grantsMapByRule(def.permission))
     .map(([name]) => name)
   assert.deepEqual(granted, ["context-manager"], `only the cartographer may be granted the map by rule; these others are: ${granted.join(", ")}`)
 
-  // The read-only tiers are stopped by permission, which is the stronger half:
-  // there is nothing there for them to disobey.
-  for (const name of ["explore-fast", "explore-deep", "plan"]) {
-    assert.equal(canWriteMap(cfg.agent[name].permission), false, `${name} must be denied the map by permission`)
+  // The stronger half, and the one this story exists for: the agents that CAN
+  // write files elsewhere cannot write the map. This used to fail for build,
+  // implement-fast and implement-deep, which all held a blanket "edit": "allow"
+  // and relied on the prompt alone to keep them out of the map.
+  for (const name of Object.keys(cfg.agent)) {
+    if (name.startsWith("context-manager")) continue
+    assert.equal(canWriteMap(cfg.agent[name].permission), false, `${name} must not be able to write the map`)
   }
 
   // And the cartographer's grant is narrow: the map, and nothing else.
@@ -446,6 +452,76 @@ test("[US-21] only the cartographer is granted the map by permission, and it may
     assert.equal(verdict(cm.permission[tool], MAP_FILE), "allow", `the cartographer must be able to ${tool} inside the map`)
     assert.equal(verdict(cm.permission[tool], "src/index.ts"), "deny", `the cartographer must not be able to ${tool} source code`)
   }
+})
+
+test("[US-21] every agent that can write files carries a narrow-last deny on both spellings of the map", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us21-narrow-deny", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+  await hooks.dispose()
+
+  // The exact pattern strings context-manager's own allow uses. Whatever makes
+  // the allow match makes the deny match, so a typo cannot creep into one side.
+  const SPELLINGS = ["*/.opencode/context/**", ".opencode/context/**"]
+
+  // Every agent that can write anything is a potential second writer, and the
+  // three that used to be gaps are named explicitly so a regression names itself.
+  const writers = ["build", "implement-fast", "implement-deep"]
+  for (const [slot, w] of [1, 2, 3, 4].map((n) => [`implement-fast-${n}`, cfg.agent[`implement-fast-${n}`]])) {
+    assert.ok(w, `${slot} must exist`)
+    writers.push(slot)
+  }
+  for (const name of writers) {
+    const rule = cfg.agent[name].permission.edit
+    assert.equal(typeof rule, "object", `${name} must scope its edit grant, not hold a bare "allow"`)
+
+    // Both spellings, because which one fires depends on the project root.
+    for (const spelling of SPELLINGS) {
+      assert.equal(rule[spelling], "deny", `${name} must deny the map at "${spelling}"`)
+    }
+
+    // And LAST, because opencode resolves by findLast over declaration order.
+    // Asserted on the object's own key order, not on a set: a deny written
+    // above the blanket allow is a table that reads correctly and behaves
+    // exactly like the gap it replaced.
+    const keys = Object.keys(rule)
+    const broad = keys.indexOf("*")
+    for (const spelling of SPELLINGS) {
+      const at = keys.indexOf(spelling)
+      assert.ok(at > broad, `${name}: "${spelling}" (position ${at}) must come AFTER "*" (position ${broad}); order decides which rule wins`)
+    }
+
+    // The deny must cost nothing else: the agent still edits ordinary files.
+    assert.equal(verdict(rule, "src/index.ts"), "allow", `${name} must still be able to edit ordinary source`)
+  }
+})
+
+test("[US-21] denying the map does not deny reading it", async () => {
+  const stub = stubInput()
+  const hooks = await bootLaCode(stub, { id: "us21-reads", dir: scratch() })
+  const cfg = emptyConfig()
+  await hooks.config(cfg)
+  await hooks.dispose()
+
+  // Closing the map to writes must not close it to the agents the standing rule
+  // tells to check it — that would turn "read one map file" into a permission
+  // error and make the whole context system unusable.
+  for (const name of ["implement-fast", "implement-deep", "explore-fast", "explore-deep", "context-manager"]) {
+    const perm = cfg.agent[name].permission
+    assert.equal(verdict(perm.read, MAP_FILE), "allow", `${name} must still be able to READ the map`)
+    assert.equal(verdict(perm.glob, MAP_FILE), "allow", `${name} must still be able to GLOB the map`)
+  }
+  // The cartographer keeps its own write grant.
+  assert.equal(verdict(cfg.agent["context-manager"].permission.edit, MAP_FILE), "allow", "the cartographer still writes the map")
+
+  // `build` is the one agent that cannot read at all — a deliberate, pre-existing
+  // decision (it delegates every question to @explore-fast), NOT a consequence of
+  // the map deny. Asserting the shape rather than the absence is what keeps the
+  // two confusable: a bare tool denial is the standing design, a map-scoped one
+  // would mean this change had leaked into reading.
+  assert.equal(cfg.agent.build.permission.read, "deny", "build must still delegate all reading rather than read the map itself")
+  assert.equal(typeof cfg.agent.build.permission.read, "string", "build's read denial must stay a whole-tool denial, not a map-scoped rule")
 })
 
 test("[US-21] the writer rule covers both path spellings opencode actually evaluates", async () => {
@@ -466,41 +542,104 @@ test("[US-21] the writer rule covers both path spellings opencode actually evalu
   }
 })
 
-test("[US-21] the injected writer rule passes the verifier, and a broken one is reported instead of silently unwritable", async () => {
+test("[US-21] the writer rule is checked in both directions: the map is writable, and writable by nobody else", async () => {
   const stub = stubInput()
-  const hooks = await bootLaCode(stub, { id: "us21-verify", dir: scratch() })
+  const hooks = await bootLaCode(stub, { id: "us21-two-way", dir: scratch() })
   const cfg = emptyConfig()
   await hooks.config(cfg)
   await hooks.dispose()
 
-  // The detector src/plugins/context-autoupdate.ts runs at startup, fed the
-  // injected rule as a user would have written it in opencode.jsonc.
-  const configFile = (permission) => {
+  const ROOT_UNDER_TEST = "/srv/work/app"
+  const MAP_UNDER_TEST = `${ROOT_UNDER_TEST}/.opencode/context`
+
+  /** A config file carrying exactly the agent permissions given. */
+  const configFile = (agents) => {
     const file = join(scratch("cfg-"), "opencode.jsonc")
-    writeFileSync(file, `{"agent":{"context-manager":{"permission":${JSON.stringify(permission)}}}}`)
+    writeFileSync(file, `{"agent":${JSON.stringify(agents)}}`)
     return file
   }
-  const shipped = configFile(cfg.agent["context-manager"].permission)
-  for (const [root, map] of [
-    ["/srv/work/app", "/srv/work/app/.opencode/context"],
-    ["/", "/home/someone/.opencode/context"],
-  ]) {
-    const problem = verifyWriterRule(shipped, map, root)
-    assert.equal(problem, undefined, `the injected rule must be writable for root ${root}: ${problem}`)
+  const shipped = (name) => ({ [name]: { permission: cfg.agent[name].permission } })
+
+  // The SHIPPED agent table passes both directions, for every project root the
+  // two spellings cover. This is the assertion that would fail if any gap agent
+  // were reverted to a blanket allow — which is exactly how the gap is policed
+  // from now on.
+  const shippedFile = configFile(
+    Object.fromEntries(Object.entries(cfg.agent).map(([name, def]) => [name, { permission: def.permission }])),
+  )
+  for (const root of [ROOT_UNDER_TEST, "/", "/root"]) {
+    const map = root === ROOT_UNDER_TEST ? MAP_UNDER_TEST : `${root === "/" ? "/home/someone" : root}/.opencode/context`
+    const problem = verifyWriterRule(shippedFile, map, root)
+    assert.equal(problem, undefined, `the shipped agent table must be clean for project root ${root}: ${problem}`)
   }
 
-  // Drop one spelling — the exact regression this detector exists for — and the
-  // report must name what it saw, what is wrong, and what the fix is.
-  const broken = configFile({
-    edit: { "*": "deny", "*/.opencode/context/**": "allow" },
-    write: { "*": "deny", "*/.opencode/context/**": "allow" },
+  // And the author's own live config agrees with the package — otherwise the
+  // published setup and the setup it actually runs have drifted apart.
+  const live = join(ROOT, "opencode.jsonc")
+  for (const root of [ROOT_UNDER_TEST, "/"]) {
+    const map = root === ROOT_UNDER_TEST ? MAP_UNDER_TEST : "/home/someone/.opencode/context"
+    const problem = verifyWriterRule(live, map, root)
+    assert.equal(problem, undefined, `opencode.jsonc must be clean for project root ${root}: ${problem}`)
+  }
+
+  // Direction 2 bites: a gap agent holding a blanket grant is reported, naming
+  // the agent and the rule that wins for the map. The blanket is written by
+  // hand rather than taken from the shipped table, because the shipped table is
+  // exactly the thing that must no longer contain one.
+  const blanket = verifyWriterRule(
+    configFile({
+      build: { permission: { edit: "allow" } },
+      "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+    }),
+    MAP_UNDER_TEST,
+    ROOT_UNDER_TEST,
+  )
+  assert.ok(blanket, "a blanket edit allow on build must be reported")
+  assert.match(blanket, /more than one writer/, "the report must say the map has a second writer")
+  assert.match(blanket, /build/, "the report must name the offending agent")
+  assert.match(blanket, /allow/, "the report must name the rule that wins")
+  assert.match(blanket, /LAST/, "the report must say ordering is what decides the winner")
+
+  // …and the very same agent passes once the deny is narrowed and placed last.
+  assert.equal(
+    verifyWriterRule(configFile(shipped("build")), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    undefined,
+    "build's shipped permission must not be reported once the deny is in place",
+  )
+
+  // The deny alone must NEVER be reported. Reasoning about which rule wins, not
+  // about whether the word "allow" appears anywhere in the table, is the whole
+  // difference between this check working and crying wolf on a correct config.
+  const denying = configFile({
+    build: { permission: { edit: { "*": "allow", "*/.opencode/context/**": "deny", ".opencode/context/**": "deny" } } },
+    "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
   })
-  const problem = verifyWriterRule(broken, "/srv/work/app/.opencode/context", "/srv/work/app")
-  assert.ok(problem, `a rule that matches nothing must be reported:\n${JSON.stringify(broken)}`)
-  assert.match(problem, /not writable/, "the report must say the map cannot be written")
-  assert.match(problem, /\*\/\.opencode\/context/, "the report must quote the rule it saw")
-  assert.match(problem, /Allow both forms/, "the report must state the fix")
-  assert.match(problem, /RELATIVE TO THE PROJECT ROOT/, "the report must state why the rule does not fire")
+  assert.equal(verifyWriterRule(denying, MAP_UNDER_TEST, ROOT_UNDER_TEST), undefined, "a correctly-ordered narrow deny is not a violation")
+
+  // Ordering is the whole point: the SAME deny written above the blanket allow
+  // loses in opencode, and must be reported as the hole it actually is.
+  const misordered = configFile({
+    build: { permission: { edit: { ".opencode/context/**": "deny", "*": "allow" } } },
+    "context-manager": { permission: { edit: { "*": "deny", "*/.opencode/context/**": "allow", ".opencode/context/**": "allow" } } },
+  })
+  const report = verifyWriterRule(misordered, MAP_UNDER_TEST, ROOT_UNDER_TEST)
+  assert.ok(report, "a deny that loses to a later blanket allow is a real hole")
+  assert.match(report, /build/, "the misordered agent must be named")
+
+  // The cartographer's own variants are exempt — including hidden slot variants.
+  assert.equal(
+    verifyWriterRule(configFile({ "context-manager-3": { permission: { edit: { "*": "deny", ".opencode/context/**": "allow" } } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    undefined,
+    "context-manager-N is the same writer and must not be flagged",
+  )
+
+  // An agent with no `edit` rule at all is not a second writer: opencode's
+  // default for an unconfigured tool is `ask`, which stops nothing by accident.
+  assert.equal(
+    verifyWriterRule(configFile({ build: { permission: { read: "allow" } } }), MAP_UNDER_TEST, ROOT_UNDER_TEST),
+    undefined,
+    "an agent that never configured `edit` is not a writer",
+  )
 })
 
 test("[US-21] non-cartographer agents are told to report map changes rather than make them", async () => {

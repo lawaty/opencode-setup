@@ -129,10 +129,26 @@ in there. The cartographer, in turn, is denied permission to write anything
 outside the map — not by convention, but by an `edit` rule that allows
 `.opencode/context/**` and nothing else.
 
+The rule runs in both directions. The agents that *could* write anywhere else in
+the repository — the root `build` agent and both implement tiers — carry the
+mirror image of the cartographer's grant: `"*": "allow"` followed by a `deny` on
+`.opencode/context/**`, so they edit everything except the map. The instruction
+telling them not to touch it is still there, and still matters — a permission
+denial tells an agent nothing about what it should have done instead — but it is
+no longer the only thing standing between them and the map.
+
 This exists because two writers produce a map that is neither current nor
 trustworthy. Concurrent sessions rewriting the same five files produce
 contradictions that no later reader can resolve, and the reader has no way to
 tell which version is newer.
+
+Ordering in those rules is not cosmetic. opencode resolves a file permission by
+taking the **last** matching rule in declaration order, with no specificity
+sorting: a `deny` written above a broad `"*": "allow"` loses. LaCode therefore
+writes every narrow rule last, in both files (`src/agents.ts` and your own
+`opencode.jsonc`), and `src/lib/writer-rule.ts` checks that order rather than
+grepping for the word `allow` — which is what stops a correctly-placed deny from
+being reported as a hole.
 
 The rule has a sharp edge worth knowing about, because it has already bitten
 this project: **opencode evaluates a file permission against the path relative
@@ -142,6 +158,31 @@ nothing at all. Both spellings are therefore required — `.opencode/context/**`
 for a normally-rooted project and `*/.opencode/context/**` for one rooted at
 `/` — and LaCode ships both. At startup the plugin checks your config for that,
 and logs an error naming the rules it saw if neither form would ever fire.
+
+### The residual risk: a subdirectory worktree
+
+Those patterns are matched against `relative(worktree, filepath)`, and the
+spelling that is supposed to fire depends on where the worktree root sits:
+
+- **worktree = repo root** → the map is `.opencode/context/architecture.md`, and
+  `.opencode/context/**` fires. `*/.opencode/context/**` does not.
+- **worktree = `/`** → the map is `home/<you>/…/.opencode/context/…`, and only
+  `*/.opencode/context/**` fires.
+
+Shipping both spellings covers those two. What it does **not** cover is a third
+case: if the worktree is a subdirectory rather than the repo root — you opened
+opencode one directory down from the repository root — then the evaluated path
+gains a prefix that matches *neither* pattern. Both rules match nothing, the
+deny against other agents silently stops applying, and **nothing is reported**,
+because a rule matching nothing is not an error in opencode's evaluator and the
+startup check has no way to see a worktree it was not told about.
+
+How to detect it: open opencode from the repository root, not from a
+subdirectory of it. If `ls .opencode/context` from your shell's current
+directory does not list the five files, your shell is not at the root and
+neither is opencode's worktree. The cost of getting it wrong is not a crash —
+it is a silent return to a map maintained only by prompt, which is the exact
+state US-21 exists to eliminate.
 
 The symptom of getting this wrong is not a crash. The cartographer's writes are
 simply denied, its run still "succeeds", and the map quietly stops changing. So
@@ -158,6 +199,7 @@ thing to check is that permission rule, not the map's content.
 | `auto update finished without changing the map` | Nothing landed. Either nothing needed saying, or the cartographer could not write. |
 | `auto update failed: …` | The run errored. The paths it was given are queued again for the next window, so the work is not lost. |
 | `context map is not writable: …` | Your config's one-writer rule does not match the path opencode evaluates. Nothing will update until you fix it. |
+| `context map has more than one writer: …` | An agent other than `context-manager` would be granted the map. The offending agent and the winning rule are named. |
 
 ## Reference
 

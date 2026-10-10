@@ -66,6 +66,20 @@ spawn recorded in `claims.<pid>.json`. A *context map* is the five-file
 - [ ] Given a slot's model is free, When the benchmark prices it, Then its cost is 0 rather than unknown or omitted.
 - [ ] Given the benchmark runs with no network access, When it cannot reach a pricing source, Then it fails loudly instead of reporting 0 cost for a paid model.
 
+### US-23: Pool models are for mechanical work, so free is the policy
+**As a** user, **I want** the shipped pool to be free models doing mechanical work, **so that** the tokens I am actually trying to save — the main model's — are not spent on reading files.
+
+**Story ID(s) for tests:** US-23
+
+This is the policy behind US-1 and it does not contradict US-7. The pool exists to take **mechanical** work — reading, searching, mechanical edits, cartography — off the main model, so the shipped slots are free. Free is the default and the documented policy; **supplying a paid model remains a supported, deliberate override**, which is why nothing here rejects one. The reconciliation is that acceptance and endorsement are different claims: the pool accepts anything, and the preset states what it is for.
+
+**Acceptance criteria:**
+- [ ] Given the bundled preset, When its slots are priced against the pinned models.dev snapshot, Then every slot is free or very cheap, and any slot the snapshot cannot price is named as unknown rather than assumed to be free.
+- [ ] Given a configured slot model the pinned snapshot prices above zero, When the plugin boots, Then it warns once, says that a priced model in a pool for mechanical work likely costs more than it saves, and names the model — and the warning never appears twice.
+- [ ] Given a configured slot model the snapshot has no price for, When the plugin boots, Then it says nothing, because an unknown price is not evidence of an expensive one and this project refuses to guess prices.
+- [ ] Given the price snapshot is absent entirely, When the advisory runs, Then it is a no-op rather than an error, and plugin startup is unaffected.
+- [ ] Given a priced model is configured in the pool, When a spawn is routed, Then it is routed to that model exactly as before: the advisory reports and never blocks, because rejecting it would break US-7.
+
 ---
 
 ## Epic B — Provider resilience (weighted model pool)
@@ -272,11 +286,17 @@ makes agents read it before they explore, then keeps it current on its own.
 **As a** user, **I want** exactly one agent allowed to write the map, **so that** concurrent sessions cannot fight over it or produce contradictory versions.
 
 **Story ID(s) for tests:** US-21
+
+Enforcement is split deliberately, and the split matters: **what the permission table enforces** is that `context-manager` can write the map and that *no other agent can*; **what the prompt enforces** is that every other agent knows to report map-relevant findings instead of making them. The permission half is the load-bearing one — it holds regardless of what the model decides to do — but it cannot tell an agent what it *should* have done, so the instruction is not redundant and is not going away.
+
 **Acceptance criteria:**
-- [ ] Given the injected agent set, When every agent's `edit` and `write` permissions are evaluated against a path inside `.opencode/context/`, Then the only agent granted the map by an explicit allow rule is `context-manager`, the read-only tiers are denied it outright, and the cartographer's grant extends to nothing outside the map.
+- [ ] Given the injected agent set, When every agent's `edit` permission is evaluated against a path inside `.opencode/context/`, Then `context-manager` is the only agent whose winning rule for that path is `allow`, and every agent that may otherwise write files carries a `deny` on both spellings of the map path — so the map is closed to non-cartographers by permission, not only by instruction.
+- [ ] Given an agent's `edit` rules are evaluated the way opencode evaluates them, When the narrow map `deny` is declared before a broad `"*": "allow"`, Then the broad rule wins and the agent is reported as a second writer; so the deny is required to be the LAST entry, and the shipped table must be declared in that order.
 - [ ] Given the `context-manager` permission rule, When it is evaluated for a normally-rooted project and for a project rooted at `/`, Then both spellings of the map path are allowed, because opencode evaluates file permissions relative to the project root.
 - [ ] Given a config whose one-writer rule allows neither spelling, When the writer rule is verified, Then it reports which rules it saw, that the map is not writable, and that both forms are required — instead of leaving a map that silently never updates.
-- [ ] Given an agent other than `context-manager` finishes work, When the standing rule reaches it, Then it is told never to edit the map itself and to report what belongs in it instead, so ownership holds even when no cartographer is watching — which is what stops the agents holding a blanket edit grant.
+- [ ] Given a config in which a non-cartographer agent would be granted the map, When the writer rule is verified, Then it reports that agent by name together with the rule that wins for it, and the report is silent once the deny is narrowed and placed last.
+- [ ] Given an agent other than `context-manager` finishes work, When the standing rule reaches it, Then it is told never to edit the map itself and to report what belongs in it instead, so that a denied agent knows what to do rather than only that it was refused.
+- [ ] Given `edit` is denied for the map, When the same agents read the map, Then reading is unaffected: the rule narrows the `edit` tool only, so the map stays readable by exactly the agents that are told to check it.
 
 ### US-22: On-demand map operations
 **As a** user, **I want** `/context-init`, `/context-update` and `/context-review`, **so that** I can bootstrap, refresh, or audit the map whenever I don't trust it.
@@ -304,6 +324,7 @@ table was filled in.
 | US-1 | A | `tests/stories/a-cost-control.test.mjs` |
 | US-2 | A | `tests/stories/a-cost-control.test.mjs` |
 | US-3 | A | `tests/stories/a-cost-control.test.mjs` (harness: `tests/benchmark/run.mjs`) |
+| US-23 | A | `tests/stories/a-cost-control.test.mjs` |
 | US-4 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-limits-test.mjs` |
 | US-5 | B | `tests/stories/b-provider-resilience.test.mjs`, `tests/pool-test.mjs`, `tests/pool-models-test.mjs` |
 | US-6 | B | `tests/stories/b-provider-resilience.test.mjs` |
