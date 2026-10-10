@@ -26,14 +26,17 @@
 // Run: node ~/.config/opencode/tests/permission-test.mjs
 import { strict as assert } from "node:assert"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { verifyWriterRule } from "../lib/writer-rule.ts"
+import { verifyWriterRule } from "../src/lib/writer-rule.ts"
 
 const REL = '".opencode/context/**":"allow"'
 const ABS = '"*/.opencode/context/**":"allow"'
-// This repo, and this repo as seen from a project root of "/".
-const REPO = "/home/yourname/.config/opencode"
+// This repo, and this repo as seen from a project root of "/". Derived from the
+// running user's home rather than hardcoded, so the fixtures are not pinned to
+// one machine's username.
+const HOME = homedir()
+const REPO = `${HOME}/.config/opencode`
 const REPO_MAP = `${REPO}/.opencode/context`
 
 const dir = mkdtempSync(join(tmpdir(), "pool-perm-"))
@@ -71,7 +74,7 @@ try {
   ok("broken message names the offending rule and the fix")
 
   // …but that same rule IS correct when the project root is "/", because the evaluated
-  // form is then "home/lawaty/.opencode/context/architecture.md".
+  // form is then "home/<you>/.opencode/context/architecture.md".
   assert.equal(verifyWriterRule(config(ABS), REPO_MAP, "/"), undefined)
   ok('absolute "*/" rule accepted when the project root is "/"')
 
@@ -104,7 +107,7 @@ try {
   const live = new URL("../opencode.jsonc", import.meta.url).pathname
   for (const [root, map] of [
     [REPO, REPO_MAP],
-    ["/", "/home/yourname/.opencode/context"],
+    ["/", `${HOME}/.opencode/context`],
     ["/srv/work/app", "/srv/work/app/.opencode/context"],
   ]) {
     const result = verifyWriterRule(live, map, root)

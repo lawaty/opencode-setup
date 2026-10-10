@@ -351,13 +351,21 @@ setup_tunnel_auth() {
   fi
 
   # The receiver lives in ~/.local/bin, not the repo: it executes on the desktop.
-  if [[ -f "$RECEIVER_SRC" ]] && [[ ! -f "$RECEIVER" ]]; then
+  #
+  # CONTENT, NOT JUST PRESENCE. Installing only when the destination is absent
+  # meant a receiver left behind by an earlier revision was never refreshed --
+  # and a stale receiver is precisely the one that mis-parses what the current
+  # sender emits, so the sender fix below would never have reached the desktop.
+  # Refresh whenever the repo copy differs from the installed one.
+  if [[ -f "$RECEIVER_SRC" ]] && { [[ ! -f "$RECEIVER" ]] || ! cmp -s "$RECEIVER_SRC" "$RECEIVER"; }; then
+    local verb="install"
+    [[ -f "$RECEIVER" ]] && verb="refresh"
     if [[ $DRY_RUN -eq 1 ]]; then
-      ok "[dry-run] would install oc-notify-receiver -> $RECEIVER"
+      ok "[dry-run] would $verb oc-notify-receiver -> $RECEIVER"
     else
       mkdir -p "$(dirname -- "$RECEIVER")"
       if cp "$RECEIVER_SRC" "$RECEIVER" && chmod 700 "$RECEIVER"; then
-        ok "installed oc-notify-receiver"
+        ok "${verb}ed oc-notify-receiver"
       else
         bad "could not install $RECEIVER -- remote notifications will not work"
         return 1
@@ -737,27 +745,30 @@ for HOST in "${HOSTS[@]}"; do
   if [[ $WITH_CONFIG -eq 1 ]]; then
     echo "  --- opencode config ---"
     if [[ $DRY_RUN -eq 1 ]]; then
-      ok "[dry-run] would rsync opencode.jsonc, pool-models.json, lib/, plugins/, .opencode/, AGENTS.md, commands/, rules/ (remote backed up first)"
+      ok "[dry-run] would rsync opencode.jsonc, src/, presets/, plugins/, .opencode/, AGENTS.md, commands/, rules/ (remote backed up first)"
     else
       if timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" \
-           "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc pool-models.json .opencode plugins lib AGENTS.md commands rules 2>/dev/null" >/dev/null 2>&1; then
+           "tar czf ~/opencode-config-backup-\$(date +%Y%m%d-%H%M%S).tar.gz --ignore-failed-read -C ~/.config/opencode opencode.jsonc presets src plugins .opencode AGENTS.md commands rules 2>/dev/null" >/dev/null 2>&1; then
         ok "remote config backed up to ~/opencode-config-backup-*.tar.gz"
       else
-        warn "remote backup failed - skipping config sync for this host"
+        warn "remote backup failed - skipping config sync for $HOST"
         FAILED+=("$HOST")
         continue
       fi
-      # lib/ must land before plugins/: the plugins import ../lib/pool.ts, so a
-      # plugins-first sync would leave them unable to resolve on next restart.
-      if [[ -d "$CONFIG_DIR/lib" ]]; then
-        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/lib' >/dev/null 2>&1
-        push "lib/" "$CONFIG_DIR/lib/" "${HOST}:~/.config/opencode/lib/" || continue
+      # src/ must land before plugins/: the plugins/ shims re-export ../src/, and
+      # src/plugins/ imports ../lib/, so a plugins-first sync would leave the host
+      # unable to resolve either and every hook dispatch dead until the next run.
+      if [[ -d "$CONFIG_DIR/src" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/src' >/dev/null 2>&1
+        push "src/" "$CONFIG_DIR/src/" "${HOST}:~/.config/opencode/src/" || continue
       fi
       push "opencode.jsonc" "$CONFIG_DIR/opencode.jsonc" "${HOST}:~/.config/opencode/" || continue
-      # pool-models.json decides which models the pool runs: lib/ and plugins/ read it,
-      # so a host missing it silently falls back to the built-in defaults.
-      if [[ -f "$CONFIG_DIR/pool-models.json" ]]; then
-        push "pool-models.json" "$CONFIG_DIR/pool-models.json" "${HOST}:~/.config/opencode/" || continue
+      # presets/free-tier.json decides which models the pool runs: src/lib/pool.ts
+      # reads it through the resolution chain, so a host missing it silently falls
+      # back to the built-in defaults instead of the intended models.
+      if [[ -d "$CONFIG_DIR/presets" ]]; then
+        timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/presets' >/dev/null 2>&1
+        push "presets/" "$CONFIG_DIR/presets/" "${HOST}:~/.config/opencode/presets/" || continue
       fi
       if [[ -d "$CONFIG_DIR/plugins" ]]; then
         timeout "$SSH_TIMEOUT" "${SSH_BASE[@]}" "$HOST" 'mkdir -p ~/.config/opencode/plugins' >/dev/null 2>&1

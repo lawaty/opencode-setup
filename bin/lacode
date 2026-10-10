@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+// lacode — the portable CLI half of LaCode.
+//
+// Three subcommands:
+//   lacode notify TITLE [MESSAGE] [URGENCY] [ICON]
+//   lacode forward HOST -- COMMAND [ARG...]
+//   lacode doctor
+//
+// Everything is best-effort by design (US-14). `notify` is fire-and-forget: an
+// unreachable desktop, a missing tunnel key, a missing notify-send -- all of them
+// exit 0 with a warning on stderr, because a notification must never be able to
+// fail the process that tried to send one. `forward` exits with the remote's
+// status, because its caller actually wants to know.
+//
+// The author's own bin/oc, oc-notify, oc-notify-receiver and oc-sync are NOT
+// replaced by this and keep working unchanged; they are wired to one person's SSH
+// topology and systemd units. This is the generic subset, published on its own.
+
+import { fileURLToPath } from "node:url"
+import { dirname, join } from "node:path"
+
+// The module is TypeScript, loaded unbundled, exactly like the opencode plugins.
+// Node strips the types on load from 22.18 / 23.6; on 22.6-22.17 the flag is
+// still required, and older node cannot run this at all. Re-exec once with the
+// flag rather than printing a second implementation of the same code in JS.
+if (!process.features?.typescript) {
+  if (process.env.LACODE_STRIP_TYPECHECKED === "1") {
+    console.error("lacode: this node cannot load TypeScript sources; node >= 22.18 is required.")
+    process.exit(1)
+  }
+  const { spawnSync } = await import("node:child_process")
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    { stdio: "inherit", env: { ...process.env, LACODE_STRIP_TYPECHECKED: "1" } },
+  )
+  process.exit(result.status ?? 1)
+}
+
+const here = dirname(fileURLToPath(import.meta.url))
+const { notify, forward, describe, safeTitle } = await import(join(here, "..", "src", "tunnel", "index.ts"))
+
+const USAGE = `lacode — portable notifications and remote exec for LaCode
+
+  lacode notify TITLE [MESSAGE] [URGENCY] [ICON]
+      Send one desktop notification. Local host: straight to the desktop
+      session. Over ssh: handed to the desktop through the reverse forward.
+      URGENCY is low | normal | critical. Fire-and-forget: always exits 0.
+
+  lacode forward HOST -- COMMAND [ARG...]
+      Run COMMAND on HOST over ssh. Exits with the remote's status.
+
+  lacode doctor
+      Print what the environment resolves to. Diagnostics only.
+
+Environment:
+  OC_LOCAL_USER        desktop user the tunnel authenticates as
+  OC_TUNNEL_PORT       reverse-forward listener port (default 10022)
+  OC_NOTIFY_KEY        dedicated key (default ~/.ssh/lacode_notify)
+  OC_CONNECT_TIMEOUT_MS / OC_SSH_TIMEOUT_MS`
+
+const argv = process.argv.slice(2)
+const command = argv.shift()
+
+switch (command) {
+  case undefined:
+  case "--help":
+  case "-h":
+  case "help":
+    console.log(USAGE)
+    process.exit(0)
+    break
+
+  case "notify": {
+    const [rawTitle, message, urgency, icon] = argv
+    if (!rawTitle) {
+      console.error("lacode notify: TITLE is required")
+      console.error(USAGE)
+      process.exit(2)
+    }
+    // A failed send is reported on stderr and then deliberately swallowed: the
+    // exit status stays 0 so a caller treating this as fire-and-forget is never
+    // broken by a sleeping laptop.
+    const result = notify({ title: rawTitle, message, urgency, icon })
+    if (!result.ok) console.error(`lacode: notification not delivered via ${result.transport}: ${result.detail ?? "unknown reason"}`)
+    process.exit(0)
+    break
+  }
+
+  case "forward": {
+    const host = argv.shift()
+    const separator = argv.indexOf("--")
+    if (!host || separator < 0 || separator === argv.length - 1) {
+      console.error("lacode forward: usage: lacode forward HOST -- COMMAND [ARG...]")
+      process.exit(2)
+    }
+    const command = argv.slice(separator + 1)
+    const result = forward(host, command)
+    if (result.stdout) process.stdout.write(result.stdout)
+    if (!result.ok) console.error(`lacode: ${host}: ${result.detail ?? "remote command failed"}`)
+    process.exit(result.ok ? 0 : 1)
+    break
+  }
+
+  case "doctor": {
+    const info = describe()
+    for (const [key, value] of Object.entries(info)) console.log(`${key.padEnd(11)} ${String(value)}`)
+    if (info.running.startsWith("remote")) {
+      if (info.user === "(unset)") console.log("\nOC_LOCAL_USER is unset: the hop cannot name the desktop user, and guessing with `id -un` is wrong on most remote accounts.")
+      console.log("Set OC_LOCAL_USER, OC_TUNNEL_PORT and OC_NOTIFY_KEY, or point OC_NOTIFY_HELPER at a helper that knows them.")
+    }
+    process.exit(0)
+    break
+  }
+
+  default:
+    console.error(`lacode: unknown command ${JSON.stringify(safeTitle(command))}`)
+    console.error(USAGE)
+    process.exit(2)
+}

@@ -8,12 +8,12 @@ and how the pieces are distributed.
 
 | Path | Role |
 |---|---|
-| `pool-models.json` | the pool's models and weights — the only file to edit to swap a model or change how many sessions it runs |
-| `opencode.jsonc` | 21 agents (3 pooled bases + 12 hidden variants + 6 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `pool-models.json` |
-| `lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
-| `lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
-| `plugins/agent-pool.ts` | task routing, limit detection, 30s hang reaper, `pool_status` |
-| `plugins/context-autoupdate.ts` | keeps `.opencode/context/` current; borrows a pool slot |
+| `presets/free-tier.json` | the bundled default pool: models and weights. Resolution chain: plugin `models` option > `~/.config/lacode/pool.json` > this file. See `presets/README.md` |
+| `opencode.jsonc` | 21 agents (3 pooled bases + 12 hidden variants + 6 unpooled), permissions, provider whitelists. The 12 variants declare **no model**: it is injected from `presets/free-tier.json` |
+| `src/lib/pool.ts` | shared state and the slot decision; imported by both plugins, exports no plugin |
+| `src/lib/writer-rule.ts` | startup check that the one-writer permission rule actually fires; imported by `context-autoupdate.ts` |
+| `src/plugins/agent-pool.ts` | task routing, limit detection, 30s hang reaper, `pool_status` |
+| `src/plugins/context-autoupdate.ts` | keeps `.opencode/context/` current; borrows a pool slot |
 | `.opencode/prompts/` | 7 prompts shared by 21 agents |
 | `tests/` | 9 offline suites, no network, no running server |
 
@@ -39,7 +39,7 @@ Log lines worth knowing: `routed <base> -> <variant>` on every pooled spawn,
 
 ## Changing the pool models
 
-Edit `pool-models.json` — one entry per slot, array position is the slot number:
+Edit `presets/free-tier.json` (or drop a `pool.json` in `~/.config/lacode/`, or pass `models` in the plugin tuple — the chain is documented in `presets/README.md`) — one entry per slot, array position is the slot number:
 
 ```json
 { "slots": [
@@ -77,7 +77,7 @@ Do **not** also edit the variant agents in `opencode.jsonc` — they carry no `m
 purpose. The plugin's config hook writes `<base>-<slot>` for `explore-fast`,
 `implement-fast` and `context-manager` from this file, and adds any missing provider
 whitelist entry. A `model` that reappears on a variant is stale: the plugin logs
-`still hard-codes … pool-models.json wins` on every start.
+`still hard-codes … presets/free-tier.json wins` on every start.
 
 Keep the provider configured in `opencode.jsonc` and the models free and tool-call
 capable — check with `curl -sS https://models.dev/api.json` or `opencode models
@@ -92,7 +92,7 @@ Failure modes are logged, never silent: a bad entry (no `provider/model-id`, a r
 model, a fifth slot) is dropped with a warning and the other slots still route; a bad
 `weight` is only a preference, so it warns and keeps the slot at weight 1; a file that
 yields nothing usable falls back to the built-in defaults. All of them appear in the log as
-`pool-models.json …`, so check
+`presets/free-tier.json …`, so check
 `tail -f ~/.local/share/opencode/log/opencode.log | grep pool-models` when a spawn
 resolves to the wrong model or lands on an unexpected slot. If the plugin is disabled
 (`opencode --pure`) the variants have no model at all and inherit the session's — check the
@@ -100,8 +100,8 @@ plugin is loading before debugging a wrong model.
 
 ## Restarts
 
-**Plugins are not hot-reloaded.** Any change to `pool-models.json`, `opencode.jsonc`,
-`lib/`, or `plugins/` requires restarting every opencode process. Servers are foreground processes with no
+**Plugins are not hot-reloaded.** Any change to `presets/free-tier.json`, `opencode.jsonc`,
+`src/lib/`, or `plugins/` requires restarting every opencode process. Servers are foreground processes with no
 systemd unit or tmux session, so each is restarted from its own terminal.
 
 This bites in a specific way: a config change is invisible until restart, so a fix can
@@ -122,7 +122,7 @@ Audited, and most of it is structural rather than redundant:
 - **Task rules use globs** (`explore-fast*`), because opencode compiles a permission
   pattern to an anchored regex with `*` → `.*` and the longest match wins. Listing all
   four variants per base meant adding a line to two agents for every new slot.
-- **The models are not here at all** — `pool-models.json` owns them and the plugin
+- **The models are not here at all** — `presets/free-tier.json` owns them and the plugin
   injects them.
 - Playwright stays: the explore and implement agents may drive a browser even though
   no prompt says so. The per-agent grant uses the deprecated `tools` field on purpose.
@@ -152,8 +152,8 @@ bin/oc-sync --host <alias>     # one host
 bin/oc-sync --scripts-only     # only `oc`, NOT the config
 ```
 
-Pushes `oc`, `oc-notify`, the tunnel key, `opencode.jsonc`, `pool-models.json`, `lib/`,
-`plugins/`, `.opencode/`, `AGENTS.md`, `commands/`, `rules/` — with a remote backup first.
+Pushes `oc`, `oc-notify`, the tunnel key, `opencode.jsonc`, `src/`, `presets/`, `plugins/`,
+`.opencode/`, `AGENTS.md`, `commands/`, `rules/` — with a remote backup first.
 
 **The config is the default, not an opt-in.** Plain `bin/oc-sync` used to ship only `oc`,
 which meant a fix to `AGENTS.md` stayed on this machine while hosts kept the old rules.
@@ -239,9 +239,9 @@ See `tests/oc-test.mjs` for the checks that keep this wired.
 
 ### When a session needs you
 
-`plugins/notify.ts` raises a notification when a session needs you, named after the
+`src/plugins/notify.ts` raises a notification when a session needs you, named after the
 session, so a long task does not need a watched terminal. It is auto-discovered from
-`plugins/` — no config entry — and the policy lives in `lib/notify.ts`, pure and
+`plugins/` — no config entry — and the policy lives in `src/lib/notify.ts`, pure and
 testable without a running server.
 
 ```
@@ -294,11 +294,15 @@ variables. `~/bin/oc` and `~/bin/oc-sync` are symlinks into the repo, so both sp
 work.
 Two ordering and scope rules that are easy to get wrong:
 
-- **`lib/` must land before `plugins/`.** Both plugins import from `../lib/`; a
-  plugins-first sync leaves them unable to resolve on next restart. `lib/` must also keep
-  exporting **no plugin**: opencode calls every export of every file in `plugins/` as a
-  plugin and uses the return value as a hooks object, so a helper left there is a broken
-  plugin. One did exactly that (`verifyWriterRule`) and opencode stopped starting.
+- **`src/` must land before `plugins/`.** The files in `plugins/` are one-line
+  re-export shims over `src/plugins/`, and those import `../lib/`; a plugins-first sync
+  leaves them unable to resolve on next restart. `presets/` must land too, or the host
+  silently falls back to the pool's built-in defaults instead of the intended models.
+- **No module under `src/` may export a plugin except `src/index.ts`.** opencode calls
+  every export of every file in `plugins/` as a plugin and uses the return value as a
+  hooks object, so a helper left there is a broken plugin. One did exactly that
+  (`verifyWriterRule`) and opencode stopped starting. The published package follows the
+  same rule with a single entry point that merges the three hook factories.
 - **`node_modules`, `package-lock.json`, and `tests/` are not synced.** Each host keeps
   its own install and SDK version. Consequence: the `1.18.34` pin in `package.json` is
   **not** enforced anywhere — it is documentation, not a constraint. Verify the SDK
@@ -348,7 +352,7 @@ Two operational rules:
   not when the project root is `/`, and `*/.opencode/context/**` fires *only* when it is.
   **Both are required.** A relative-only rule was silently broken first; "fixing" it to the
   absolute form (`6f6af0a`) silently broke it again, because the detector was checking the
-  absolute path too. `lib/writer-rule.ts` now checks the form that applies to the running
+  absolute path too. `src/lib/writer-rule.ts` now checks the form that applies to the running
   project's root and logs an error naming the offending rule; `tests/permission-test.mjs`
   pins both directions, including against the real `opencode.jsonc`.
 
@@ -357,7 +361,7 @@ Force a run with `/context-update` rather than waiting for the idle trigger.
 ## Version control
 
 This repo (`~/.config/opencode`) is a git repository, public at
-`github.com/lawaty/opencode-setup`, tracking `origin/master`.
+`github.com/lawaty/lacode`, tracking `origin/master`.
 
 Not covered by git:
 

@@ -4,8 +4,13 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const PLUGIN = join(HERE, "..", "plugins", "notify.ts")
-const LIB = join(HERE, "..", "lib", "notify.ts")
+// The source of truth. plugins/notify.ts is a dev-only re-export shim so
+// opencode's directory auto-discovery still finds this code in the working tree;
+// the published package has one plugin, src/index.ts, and the suites test the
+// factories that index.ts composes.
+const PLUGIN = join(HERE, "..", "src", "plugins", "notify.ts")
+const SHIM = join(HERE, "..", "plugins", "notify.ts")
+const LIB = join(HERE, "..", "src", "lib", "notify.ts")
 
 let passed = 0
 const failures = []
@@ -24,7 +29,7 @@ const assert = (condition, message) => {
 }
 
 const { Notifier, notifyMessage, questionHeadline, safeTitle, shouldNotify } = await import(LIB)
-const { Notify } = await import(PLUGIN)
+const { notifyHooks: Notify } = await import(PLUGIN)
 
 // ---------------------------------------------------------------------------
 // Policy: what is worth notifying about
@@ -230,12 +235,26 @@ await check("the rate limiter bounds its bookkeeping", () => {
 
 const pluginSrc = readFileSync(PLUGIN, "utf8")
 
-await check("the plugin exports exactly one binding", () => {
+await check("the plugin module exports exactly one binding", () => {
   // opencode calls every export of every plugins/ file and uses the return value
-  // as its hooks object, so a second export is a second broken plugin.
+  // as its hooks object, so a second export is a second broken plugin. Same rule
+  // for the published package, which is why only src/index.ts exports a plugin
+  // and every other module under src/ is a factory.
   const exports = [...pluginSrc.matchAll(/^export (?:const|function|class|default)\s+(\w+)/gm)].map((m) => m[1])
   assert(exports.length === 1, `expected 1 export, found ${exports.length}: ${exports.join(", ")}`)
-  assert(exports[0] === "Notify", `unexpected export name ${exports[0]}`)
+  assert(exports[0] === "notifyHooks", `unexpected export name ${exports[0]}`)
+})
+
+await check("the dev shim re-exports it under the plugin name, and nothing else", () => {
+  // A plugin file must export exactly one plugin. The shim exists only so
+  // opencode's plugins/ auto-discovery keeps working locally; if it ever grows a
+  // second export, every hook dispatch in the process breaks.
+  const shim = readFileSync(SHIM, "utf8")
+  const bindings = [...shim.matchAll(/^export\s*\{([^}]*)\}/gm)].flatMap((m) => m[1].split(",").map((s) => s.trim().split(/\s+as\s+/).pop()))
+  const direct = [...shim.matchAll(/^export (?:const|function|class|default)\s+/gm)]
+  assert(bindings.length === 1 && direct.length === 0,
+    `a plugin file must export exactly one plugin, found ${bindings.length + direct.length}`)
+  assert(bindings[0] === "Notify", `unexpected shim export ${bindings[0]}`)
 })
 
 await check("the plugin defers to the tested tunnel helper", () => {
@@ -263,7 +282,7 @@ await check("a missing helper warns once, never throws", () => {
 await check("the plugin is registered by directory, not config", async () => {
   // plugins/*.ts is auto-discovered, so no opencode.jsonc entry is needed. This
   // asserts the file is where discovery will find it.
-  assert(existsSync(PLUGIN), "plugins/notify.ts should exist")
+  assert(existsSync(SHIM), "plugins/notify.ts should exist so opencode auto-discovery finds the shim")
 })
 
 // ---------------------------------------------------------------------------

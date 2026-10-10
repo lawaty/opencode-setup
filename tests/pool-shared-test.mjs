@@ -10,12 +10,12 @@ import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
-const POOL = join(HERE, "..", "lib", "pool.ts")
+const POOL = join(HERE, "..", "src", "lib", "pool.ts")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
-// pool-models.json owns the pool's models; the tests below refer to slot N's
+// presets/free-tier.json owns the pool's models; the tests below refer to slot N's
 // model, so swapping a model is not a test edit.
-const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
+const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots
 const SLOT_MODELS = SHIPPED.map((s) => s.model)
 
 let failures = 0
@@ -35,7 +35,7 @@ const scratch = () => {
 
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
-const { AgentPool } = await import(join(HERE, "..", "plugins", "agent-pool.ts"))
+const { agentPoolHooks: AgentPool } = await import(join(HERE, "..", "src", "plugins", "agent-pool.ts"))
 const pool = await import(POOL)
 
 const mk = async (id, dir) => {
@@ -57,7 +57,7 @@ const BASES = ["explore-fast", "implement-fast", "context-manager"]
 // for that slot) comes back unrouted, so return -1 rather than throwing.
 const slotOf = (variant) => (variant === null || variant === undefined ? -1 : Number(/-(\d+)$/.exec(variant)?.[1] ?? -1))
 // Slot numbers per weight, so these checks hold whatever weights and order
-// pool-models.json lists its slots in. pickSlot compares weights, not
+// presets/free-tier.json lists its slots in. pickSlot compares weights, not
 // position: what "a workhorse slot" and "a reserve slot" mean is the file's.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
 const slotsOfWeight = (weight) => SHIPPED.flatMap((s, i) => (s.weight === weight ? [i + 1] : []))
@@ -81,7 +81,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
     if (missing.length > 0) {
       // this assert only records a failure and continues, so the body must not
       // run on the missing variants
-      assert(false, `slot ${i} has no variant in opencode.jsonc for ${missing.join(",")}; add them or drop the slot from pool-models.json`)
+      assert(false, `slot ${i} has no variant in opencode.jsonc for ${missing.join(",")}; add them or drop the slot from presets/free-tier.json`)
       continue
     }
     const models = declared.map((d) => d.model)
@@ -100,7 +100,7 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
   // The claim is that base type does not matter, so the reference is the same
   // number of spawns from one base type in a fresh pool. Comparing against a run
   // instead of a literal sequence keeps this independent of both the slot
-  // numbering and the weights in pool-models.json.
+  // numbering and the weights in presets/free-tier.json.
   const solo = await mk("shared-1-solo", scratch())
   const soloPicks = []
   for (let i = 0; i < picks.length; i++) soloPicks.push(slotOf(await solo.spawn(`s${i}`, BASES[0])))

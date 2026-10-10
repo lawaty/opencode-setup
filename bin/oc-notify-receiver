@@ -6,16 +6,55 @@
 # so the tunnel key can do exactly this and nothing else: no shell, no PTY, no
 # agent or port forwarding. Do not relax those options.
 #
-# It parses argv rather than re-running the string, so a remote cannot smuggle a
-# second command through SSH_ORIGINAL_COMMAND. The only value it interpolates
-# into a notify-send call is the icon, and that is whitelisted.
+# THE PAYLOAD IS $SSH_ORIGINAL_COMMAND, NOT THE POSITIONAL PARAMETERS.
+#
+# OpenSSH concatenates every argument after the host into ONE command string, and
+# a forced command is started with no arguments of its own. A receiver that reads
+# "$1".."$4" therefore sees four empty strings, falls back to four defaults, and
+# pops up an empty notification -- which is exactly what this script used to do.
+# The sender therefore passes a SINGLE argument of the form:
+#
+#     title\nmessage\nurgency\nicon
+#
+# NEWLINE is the delimiter because both senders strip control characters from the
+# title and the message before assembling the payload, so no field can contain
+# one. The sender and this receiver are versioned together; oc-sync installs both.
+#
+# $SSH_ORIGINAL_COMMAND is ATTACKER-CONTROLLED: it is whatever the remote host's
+# user typed on the ssh command line, and this script runs as the desktop user.
+#
+#   NEVER `eval "$SSH_ORIGINAL_COMMAND"`
+#   NEVER `sh -c "$SSH_ORIGINAL_COMMAND"`
+#   NEVER splice it into an argument list
+#
+# `restrict` in authorized_keys is the only thing containing that input, so it
+# must stay DATA all the way to notify-send. Urgency and icon become command-line
+# flags (--urgency=..., --icon=...), so an unvalidated value there is an injection
+# risk in its own right; both are checked against a whitelist below.
 
 set -uo pipefail
 
-TITLE="${1:-OpenCode}"
-MSG="${2:-}"
-URGENCY="${3:-normal}"
-ICON="${4:-utilities-terminal}"
+# mapfile -t splits on newlines only: no word splitting, so a message full of
+# spaces survives intact, and no globbing, so a message full of `*` does too.
+# Fields past the fourth are ignored -- not merged, not executed.
+mapfile -t fields <<<"${SSH_ORIGINAL_COMMAND-}"
+
+TITLE="${fields[0]:-LaCode}"
+MSG="${fields[1]:-}"
+URGENCY="${fields[2]:-normal}"
+ICON="${fields[3]:-utilities-terminal}"
+
+# Both senders already strip control characters; this is the trust boundary, so
+# the check is repeated here rather than assumed from the other end.
+TITLE="${TITLE//[[:cntrl:]]/ }"
+MSG="${MSG//[[:cntrl:]]/ }"
+
+# A payload with no newline at all is the OLD sender's argument list, already
+# flattened by ssh into one space-joined string. That is the bug this receiver
+# used to hit, and its symptom (an empty popup) points nowhere, so name it.
+if [[ -n "${SSH_ORIGINAL_COMMAND-}" && "${#fields[@]}" -lt 2 ]]; then
+  echo "oc-notify: payload is not newline-delimited; the remote's oc is older than this receiver (run oc-sync there)" >&2
+fi
 
 case "$URGENCY" in
   low|normal|critical) ;;

@@ -7,15 +7,15 @@ import { fileURLToPath } from "node:url"
 // live anywhere inside the config tree.
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
-const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
+const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const SNAPSHOT = join(HERE, "models-snapshot.json")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
-// pool-models.json is the single source of truth for the pool, so the test reads
+// presets/free-tier.json is the single source of truth for the pool, so the test reads
 // it rather than repeating the models: swapping one is not a test edit.
-const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
+const SHIPPED = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots
 const SLOT_MODELS = SHIPPED.map((s) => s.model)
-// pool-models.json's weight is the only routing knob, so the tests talk about the
+// presets/free-tier.json's weight is the only routing knob, so the tests talk about the
 // heaviest slot and the lightest slots rather than a tier name the file no longer
 // carries. Which slots those are is the file's business.
 const MAX_WEIGHT = Math.max(...SHIPPED.map((s) => s.weight))
@@ -28,8 +28,8 @@ const CAPACITY = SHIPPED.reduce((sum, s) => sum + s.weight, 0)
 
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
-const pool = await import(join(HERE, "..", "lib", "pool.ts"))
-const { AgentPool } = await import(PLUGIN)
+const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
 const assert = (cond, msg) => {
   if (!cond) {
@@ -59,7 +59,7 @@ const seq = (calls) => calls.map((c) => c.replace(/^[a-z-]+-/, "")).join(",")
 // 1. routing: priority IS the weight, and it is a soft ceiling. The heaviest slot
 //    fills to its own weight before the next slot sees any work, slots fill in weight
 //    order, and only past the summed ceilings does the overflow spread evenly. Slot
-//    numbers, weights and pick order are pool-models.json's business, so what is
+//    numbers, weights and pick order are presets/free-tier.json's business, so what is
 //    pinned here is the property, not a literal sequence.
 const a = await make("solo", dir1)
 const calls = []
@@ -204,7 +204,7 @@ const loadOf = (model) => {
 // The spawns are spread over the weights, so the invariants are what hold for any
 // slot count: every claim is visible to both processes, slots of equal weight stay
 // load-balanced among themselves, and the heaviest slots hold more than the
-// lightest. Which slot is 1 is pool-models.json's business.
+// lightest. Which slot is 1 is presets/free-tier.json's business.
 const loadList = SLOT_MODELS.map(loadOf)
 
 const report = SHIPPED.map((s, i) => `${s.model}(w${s.weight})=${loadList[i]}`).join(" ")
@@ -286,7 +286,7 @@ await a.hooks["tool.execute.before"]({ tool: "task", sessionID: "s1", callID: "x
 await a.finish("nonexistent")
 
 // 10. config invariants: every pooled base has one hidden variant per slot in
-//     pool-models.json, each running that slot's model -- and none of them
+//     presets/free-tier.json, each running that slot's model -- and none of them
 //     hard-codes one, so the file really is the only place a pool model lives
 const rawCfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 const BASES = ["explore-fast", "implement-fast", "context-manager"]
@@ -294,7 +294,7 @@ for (const base of BASES) {
   SLOT_MODELS.forEach((_, i) => {
     const v = `${base}-${i + 1}`
     assert(rawCfg.agent[v] !== undefined, `${v} must be declared in opencode.jsonc`)
-    assert(rawCfg.agent[v].model === undefined, `${v} must not hard-code a model; pool-models.json injects it`)
+    assert(rawCfg.agent[v].model === undefined, `${v} must not hard-code a model; presets/free-tier.json injects it`)
   })
 }
 for (const base of BASES) {
@@ -380,7 +380,7 @@ for (const [name, def] of Object.entries(rawCfg.agent)) {
 //     Refreshing it is part of changing the pool: the snapshot is the record of
 //     what each model cost when it was picked, and a model missing from it has not
 //     been checked at all. Regenerate with the helper, which reads the current
-//     pool-models.json so nothing has to be listed twice:
+//     presets/free-tier.json so nothing has to be listed twice:
 //       node ~/.config/opencode/tests/refresh-models-snapshot.mjs
 assert(existsSync(SNAPSHOT), `missing ${SNAPSHOT}; run: node tests/refresh-models-snapshot.mjs`)
 const snapshot = JSON.parse(readFileSync(SNAPSHOT, "utf8"))

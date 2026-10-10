@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url"
 // same model, so `explore-fast-2` and `context-manager-2` are the same model and
 // share one load counter.
 //
-// Every slot carries a `weight` (pool-models.json), and that is the only knob. A
+// Every slot carries a `weight` (the preset), and that is the only knob. A
 // slot's weight is a SOFT CEILING on how many claims it holds at once, and priority is
 // simply that weight: the highest-weight slot that is still under its ceiling takes
 // the next spawn, so the pool fills slot 1 to its number before slot 2 sees any work
@@ -23,14 +23,22 @@ import { fileURLToPath } from "node:url"
 // so the overflow goes to the least loaded slot -- the pool never blocks, and a burst
 // past the summed ceilings degrades to even spreading rather than piling on slot 1.
 //
-// This module holds the state and the decision; plugins/agent-pool.ts owns the
-// hooks (task routing, limit detection, hang reaping) and
-// plugins/context-autoupdate.ts borrows a slot directly, because it spawns its
-// agent through the session API rather than the task tool and so never passes
-// through the task hook.
+// This module holds the state and the decision; src/plugins/agent-pool.ts owns
+// the hooks (task routing, limit detection, hang reaping) and
+// src/plugins/context-autoupdate.ts borrows a slot directly, because it spawns
+// its agent through the session API rather than the task tool and so never
+// passes through the task hook.
 //
-// Which models fill the slots comes from pool-models.json (see readSlotFile),
-// resolved once per process into State.slots and shared by both plugins.
+// Which models fill the slots comes from the preset resolution chain (see
+// resolveModels), resolved once per process into State.slots and shared by every
+// hook in the process.
+//
+// COST IS THE USER'S CHOICE (US-7). Nothing here, and nothing in the preset
+// loader, asks what a model costs or whether it is free: any provider/model-id
+// string is accepted, paid or not. The bundled preset happens to be built from
+// free models because that is a good default, not because the pool requires it.
+// Validation below is STRUCTURAL ONLY -- shape of the models object, weights in
+// range, slots distinct and under the cap.
 
 export const CLAIM_TTL_MS = 10 * 60 * 1000
 export const DEAD_FILE_MS = 2 * CLAIM_TTL_MS
@@ -44,11 +52,12 @@ export const HANG_COOLDOWN_MS = 10 * 60 * 1000
 // describing concurrency and becomes a way to silence load balancing entirely, which
 // is a config error rather than a value to honour.
 export const MAX_WEIGHT = 100
-// opencode.jsonc declares exactly one hidden variant per base per slot, and a pool
-// larger than that would route to agents that do not exist, so the file is capped
-// rather than trusted: slot 5 and beyond are dropped with a warning. Four is also
-// all the pool needs -- with two providers at two slots each, a provider-wide limit
-// already takes out half of it.
+// opencode.jsonc -- and, for an installed package, the agent set injected by
+// src/index.ts -- declares exactly one hidden variant per base per slot, and a
+// pool larger than that would route to agents that do not exist, so the slot
+// count is capped rather than trusted: slot 5 and beyond are dropped with a
+// warning. Four is also all the pool needs -- with two providers at two slots
+// each, a provider-wide limit already takes out half of it.
 export const MAX_SLOTS = 4
 const COOLDOWN_BASE_MS = 60 * 1000
 const COOLDOWN_MAX_MS = 15 * 60 * 1000
@@ -68,15 +77,32 @@ export type Snapshot = {
 
 export const BASES = ["explore-fast", "implement-fast", "context-manager"]
 
-// The pool is configured by ONE hand-edited file, pool-models.json, next to
-// opencode.jsonc. The variant agents in opencode.jsonc (explore-fast-1 ...)
-// are rewritten from it at config time by plugins/agent-pool.ts, so swapping a
-// model means editing this file, never a dozen agent definitions. The values
-// below are the fallback used only when the file is missing or unusable, so a
-// typo degrades to a logged warning instead of a pool that cannot route.
-export const MODELS_FILE = "pool-models.json"
-export const CONFIG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..")
-export const MODELS_PATH = join(CONFIG_DIR, MODELS_FILE)
+// ---------------------------------------------------------------------------
+// Preset resolution chain
+// ---------------------------------------------------------------------------
+//
+// The pool's slots are configuration, not code. Three sources are consulted in
+// this order, and the first one that yields usable slots wins:
+//
+//   1. plugin options   ["@lawaty/lacode", { "models": { "slots": [...] } }]
+//   2. user config      ~/.config/lacode/pool.json
+//   3. bundled preset   <package root>/presets/free-tier.json
+//
+// Anything missing or unusable falls through silently to the next link; the
+// built-in FALLBACK_SLOTS below is the last resort so routing always works. A
+// typo in a preset is a logged warning, never an exception -- a pool that cannot
+// route takes every parallel spawn in the process down with it.
+//
+// The explicit `modelsFile` option (tests, and anyone pointing at one file
+// explicitly) short-circuits the chain.
+
+/** Package root: two levels up from src/lib/, i.e. the repo or the installed package. */
+export const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..")
+export const PRESETS_DIR = join(PACKAGE_ROOT, "presets")
+export const DEFAULT_PRESET = join(PRESETS_DIR, "free-tier.json")
+/** The user's own pool file. Absent is normal and never an error. */
+export const USER_CONFIG_DIR = join(homedir(), ".config", "lacode")
+export const USER_MODELS_PATH = join(USER_CONFIG_DIR, "pool.json")
 
 export const FALLBACK_SLOTS: Slot[] = [
   { index: 1, model: "opencode/space-bunny-free", weight: 3 },
@@ -87,7 +113,10 @@ export const FALLBACK_SLOTS: Slot[] = [
 
 export type SlotFile = { slots: Slot[]; problems: string[] }
 
-// Slot indices are the array position, so the file is the only place a slot
+/** Human-readable origin of a slot list, used in log lines and warnings. */
+export type ModelsSource = { slots: Slot[]; problems: string[]; origin: string }
+
+// Slot indices are the array position, so the source is the only place a slot
 // number exists; nothing downstream can disagree with it. Every entry is
 // validated on its own: one bad slot is dropped with a warning, the rest still
 // route, unless nothing survives and the built-in defaults take over.
@@ -96,35 +125,120 @@ export type SlotFile = { slots: Slot[]; problems: string[] }
 // rather than dropping the slot -- losing a model because of a typo in a count would
 // cost real capacity. A slot with no weight at all is weight 1, i.e. one session at
 // a time before the next slot is considered.
-export function readSlotFile(path: string = MODELS_PATH): SlotFile {
+export function parseSlots(parsed: unknown, origin: string): SlotFile {
   const problems: string[] = []
-  let parsed: { slots?: unknown }
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as { slots?: unknown }
-  } catch (error) {
-    return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${String(error)}); using built-in defaults`] }
-  }
-  if (!Array.isArray(parsed.slots) || parsed.slots.length === 0) {
-    return { slots: FALLBACK_SLOTS, problems: [`${path} has no non-empty "slots" array; using built-in defaults`] }
+  const entries = (parsed as { slots?: unknown })?.slots
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { slots: FALLBACK_SLOTS, problems: [`${origin} has no non-empty "slots" array; using built-in defaults`] }
   }
   const slots: Slot[] = []
-  parsed.slots.forEach((entry, i) => {
+  entries.forEach((entry, i) => {
     const model = typeof (entry as { model?: unknown })?.model === "string" ? ((entry as { model: string }).model).trim() : ""
     const at = `slot ${i + 1}`
     if (slots.length >= MAX_SLOTS) {
-      problems.push(`${at} (${model || "?"}): the pool is capped at ${MAX_SLOTS} slots (opencode.jsonc declares one variant per base per slot); entry ignored`)
+      problems.push(`${at} (${model || "?"}): the pool is capped at ${MAX_SLOTS} slots (one variant agent per base per slot is declared); entry ignored`)
       return
     }
+    // The only per-model rule there is: a slot must be addressable. Whether it
+    // costs money is never inspected (US-7).
     if (!model.includes("/")) return problems.push(`${at}: model must be written provider/model-id, got "${model}"`)
     const weight = readWeight(entry, at, model, problems)
     if (slots.some((s) => s.model === model)) return problems.push(`${at}: ${model} is already used by another slot; slots must be distinct models`)
     slots.push({ index: slots.length + 1, model, weight })
   })
   if (slots.length === 0) {
-    problems.push(`${path} yielded no usable slot; using built-in defaults`)
+    problems.push(`${origin} yielded no usable slot; using built-in defaults`)
     return { slots: FALLBACK_SLOTS, problems }
   }
   return { slots, problems }
+}
+
+const readJSON = (path: string): { ok: true; value: unknown } | { ok: false; error: string } => {
+  try {
+    return { ok: true, value: JSON.parse(readFileSync(path, "utf8")) }
+  } catch (error) {
+    return { ok: false, error: String(error) }
+  }
+}
+
+// Present so a user who finds the preset loader surprising has one place to look.
+// An absent user file is NOT a problem to report -- it is the normal case for
+// everyone but the package author -- so only an unreadable/!JSON file warns.
+function readOptional(path: string, origin: string, problems: string[]) {
+  const result = readJSON(path)
+  if (!result.ok) {
+    if (existsSync(path)) problems.push(`${origin} unreadable (${result.error}); trying the next source`)
+    return undefined
+  }
+  return result.value
+}
+
+/**
+ * Resolve the slot list through the chain documented above.
+ *
+ * @param input.models     inline `{ slots: [...] }` from plugin options (highest priority)
+ * @param input.modelsFile an explicit file, which short-circuits the chain
+ */
+export function resolveModels(input: { models?: unknown; modelsFile?: string } = {}): ModelsSource {
+  const problems: string[] = []
+
+  if (input.models !== undefined) {
+    const origin = "plugin options"
+    if (typeof input.models !== "object" || input.models === null || Array.isArray(input.models)) {
+      return { slots: FALLBACK_SLOTS, problems: [`${origin}: "models" must be an object like {"slots":[...]}`], origin }
+    }
+    const parsed = parseSlots(input.models, origin)
+    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin }
+  }
+
+  if (input.modelsFile) {
+    const result = readJSON(input.modelsFile)
+    if (!result.ok) return { slots: FALLBACK_SLOTS, problems: [`${input.modelsFile} unreadable (${result.error}); using built-in defaults`], origin: input.modelsFile }
+    const parsed = parseSlots(result.value, input.modelsFile)
+    return { slots: parsed.slots, problems: parsed.problems, origin: input.modelsFile }
+  }
+
+  // 2. the user's own file, then 3. the bundled preset.
+  const user = readOptional(USER_MODELS_PATH, USER_MODELS_PATH, problems)
+  if (user !== undefined) {
+    const parsed = parseSlots(user, USER_MODELS_PATH)
+    // parseSlots returns the FALLBACK_SLOTS array itself when it had to give up,
+    // which is the honest signal that the user's file was structurally broken:
+    // fall through to the bundled preset rather than leaving the pool on the
+    // generic fallback while a real preset is sitting right there.
+    if (parsed.slots !== FALLBACK_SLOTS) return { slots: parsed.slots, problems, origin: USER_MODELS_PATH }
+    problems.push(...parsed.problems)
+  }
+
+  const preset = readOptional(DEFAULT_PRESET, DEFAULT_PRESET, problems)
+  if (preset !== undefined) {
+    const parsed = parseSlots(preset, "presets/free-tier.json")
+    return { slots: parsed.slots, problems: [...problems, ...parsed.problems], origin: "presets/free-tier.json" }
+  }
+
+  return { slots: FALLBACK_SLOTS, problems: [...problems, `no pool source found (${USER_MODELS_PATH}, ${DEFAULT_PRESET}); using built-in defaults`], origin: "built-in defaults" }
+}
+
+export function readSlotFile(path: string): SlotFile {
+  const result = readJSON(path)
+  if (!result.ok) return { slots: FALLBACK_SLOTS, problems: [`${path} unreadable (${result.error}); using built-in defaults`] }
+  return parseSlots(result.value, path)
+}
+
+/**
+ * Make `~/.config/lacode/` exist so a user can drop a `pool.json` into it without
+ * first having to `mkdir`. Called once at plugin startup, never during a read:
+ * a library that creates directories as a side effect of being asked a question
+ * is a library nobody trusts. Never throws -- an unwritable HOME just means the
+ * bundled preset is used, which is the normal case anyway.
+ */
+export function ensureUserConfigDir(): boolean {
+  try {
+    mkdirSync(USER_CONFIG_DIR, { recursive: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 // `weight` is the soft ceiling on a slot's concurrent claims, and its priority;
@@ -139,7 +253,7 @@ function readWeight(entry: unknown, at: string, model: string, problems: string[
       // One line per distinct value: warnOnce collapses the repeats, so a whole
       // legacy file logs once for "primary" and once for "overflow".
       problems.push(
-        `${MODELS_FILE}: "tier" is deprecated; write "weight" instead (primary is weight 2, overflow is weight 1), got ${JSON.stringify(legacy)}`,
+        `weight: "tier" is deprecated; write "weight" instead (primary is weight 2, overflow is weight 1), got ${JSON.stringify(legacy)}`,
       )
       if (legacy === "primary" || legacy === "overflow") return legacy === "primary" ? 2 : 1
     }
@@ -205,17 +319,24 @@ type State = {
   lastSweep: number
   id: string
   dir: string
-  modelsFile: string
+  modelsFile?: string
+  /** Inline `{ slots: [...] }` from plugin options, if the caller passed one. */
+  inlineModels?: unknown
+  origin: string
   slots: Slot[]
 }
 
-export function state(opts: { id?: string; dir?: string; modelsFile?: string } = {}): State {
+export function state(opts: { id?: string; dir?: string; modelsFile?: string; models?: unknown } = {}): State {
   const id = opts.id ?? String(process.pid)
   const dir = opts.dir ?? join(homedir(), ".local", "share", "opencode", "agent-pool")
-  const modelsFile = opts.modelsFile ?? MODELS_PATH
-  // Keyed by identity so the pool plugin and context-autoupdate share one state
-  // in a process (same pid + dir), while separate ids stay independent.
-  const key = Symbol.for(`agent-pool:state:${id}:${dir}:${modelsFile}`)
+  const modelsFile = opts.modelsFile
+  const models = opts.models
+  // Keyed by identity so every hook in one process shares one state (same id +
+  // dir + models source), while separate ids stay independent. Inline plugin
+  // options are keyed by presence, not by value: two calls with the same models
+  // object still share, which is what lets the router and the cartographer agree
+  // on which slot each other are holding.
+  const key = Symbol.for(`agent-pool:state:${id}:${dir}:${modelsFile ?? ""}:${models === undefined ? "" : "inline"}`)
   const g = globalThis as Record<symbol, State | undefined>
   if (!g[key]) {
     g[key] = {
@@ -235,6 +356,8 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string } =
       id,
       dir,
       modelsFile,
+      inlineModels: models,
+      origin: "unresolved",
       slots: [],
     }
   }
@@ -242,11 +365,12 @@ export function state(opts: { id?: string; dir?: string; modelsFile?: string } =
 }
 
 // Read once per process, on first use: plugins are not hot-reloaded, so editing
-// pool-models.json means restarting opencode anyway.
+// the preset means restarting opencode anyway.
 export function ensureSlots(s: State, onWarn: (m: string) => void) {
   if (s.slots.length > 0) return s.slots
-  const { slots, problems } = readSlotFile(s.modelsFile)
+  const { slots, problems, origin } = resolveModels({ models: s.inlineModels, modelsFile: s.modelsFile })
   s.slots = slots
+  s.origin = origin
   for (const problem of problems) onWarn(problem)
   return slots
 }

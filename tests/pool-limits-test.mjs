@@ -8,15 +8,15 @@ import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
-const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
+const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
-// pool-models.json owns the pool's models; the provider/modelID pairs every
+// presets/free-tier.json owns the pool's models; the provider/modelID pairs every
 // limit event needs are split from it, so swapping a model is not a test edit.
 // Slots are also looked up by weight, since the tests care about "a heaviest slot"
 // and "a lightest slot", not about which number either happens to be.
-const { splitModel } = await import(join(HERE, "..", "lib", "pool.ts"))
-const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots.map((s, i) => {
+const { splitModel } = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots.map((s, i) => {
   const { provider, id: modelID } = splitModel(s.model)
   return { model: s.model, provider, modelID, weight: s.weight, index: i + 1 }
 })
@@ -42,7 +42,7 @@ globalThis.fetch = async (url) => {
   return new Response("true", { status: 200 })
 }
 
-const { AgentPool } = await import(PLUGIN)
+const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
 let failures = 0
 const assert = (cond, msg) => {
@@ -87,7 +87,7 @@ const dirB = scratch()
   const a = await mk("p1", dirA)
   // Baseline first: an idle pool hands out a heaviest slot. Cool whichever model
   // that spawn actually claimed (read back from the pool, not guessed from the
-  // file), so this holds whatever pool-models.json names and in whatever order.
+  // file), so this holds whatever presets/free-tier.json names and in whatever order.
   const baseline = await a.spawn("a1")
   const slot = SLOTS[Number(/-(\d+)$/.exec(baseline)[1]) - 1]
   assert(slot?.weight === MAX_WEIGHT, `baseline must route to a heaviest slot, got ${baseline}`)

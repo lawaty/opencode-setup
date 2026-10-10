@@ -17,3 +17,8 @@ auth.json
 !.env.example
 *.pem
 *.key
+
+# The generated benchmark table. docs/BENCHMARKS.md beside it is HAND WRITTEN --
+# the explainer that ships. A generated artifact is a local, dated result and
+# must never be committed next to it as though it were a published measurement.
+docs/BENCHMARKS.generated.md

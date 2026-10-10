@@ -1,7 +1,7 @@
 // Rebuild tests/models-snapshot.json from models.dev for exactly the models
-// pool-models.json currently names, so swapping a pool model does not leave a
+// presets/free-tier.json currently names, so swapping a pool model does not leave a
 // stale snapshot behind (pool-test.mjs fails on any slot the snapshot has never
-// seen). Run after editing pool-models.json:
+// seen). Run after editing presets/free-tier.json:
 //
 //   node ~/.config/opencode/tests/refresh-models-snapshot.mjs
 //
@@ -14,7 +14,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const MODELS = join(HERE, "..", "pool-models.json")
+const MODELS = join(HERE, "..", "presets", "free-tier.json")
 const SNAPSHOT = join(HERE, "models-snapshot.json")
 const SOURCE = "https://models.dev/api.json"
 

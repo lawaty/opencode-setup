@@ -1,6 +1,56 @@
 {
+  "name": "@lawaty/lacode",
+  "version": "0.1.0",
+  "description": "Ultimate opencode setup for Go users — cost-controlled pooled subagents, hang recovery, and notifications for opencode.",
+  "license": "MIT",
   "type": "module",
-  "dependencies": {
+  "author": {
+    "name": "lawaty",
+    "url": "https://github.com/lawaty"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lawaty/lacode.git"
+  },
+  "homepage": "https://github.com/lawaty/lacode#readme",
+  "bugs": {
+    "url": "https://github.com/lawaty/lacode/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "subagents",
+    "cost-optimization",
+    "model-pool",
+    "notifications"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./pool": "./src/lib/pool.ts",
+    "./agents": "./src/agents.ts",
+    "./commands": "./src/commands.ts",
+    "./tunnel": "./src/tunnel/index.ts",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "lacode": "./bin/lacode"
+  },
+  "files": [
+    "src",
+    "presets",
+    "bin/lacode",
+    "LICENSE",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "test": "node --test tests/",
+    "benchmark": "node tests/benchmark/run.mjs"
+  },
+  "peerDependencies": {
     "@opencode-ai/plugin": "1.18.34"
   }
 }

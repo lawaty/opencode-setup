@@ -26,8 +26,9 @@ set -uo pipefail
 # Three things this deliberately does NOT do, each of which is a trap:
 #
 #   * It does not build a notify-send command string and hand it to a remote
-#     shell. The command is sent as argv and executed LOCALLY by the forced
-#     command, so a remote host cannot append a second command to it.
+#     shell for evaluation. The notification crosses the hop as ONE
+#     newline-delimited argument, which the forced command parses as data, so a
+#     remote host cannot append a second command to it.
 #   * It does not build the dbus path from the REMOTE uid. `id -u` on a root host
 #     is 0, and /run/user/0/bus does not exist on your desktop — the old script
 #     did exactly that, which silently sent every notification into the void.
@@ -127,6 +128,13 @@ send_notify() {
   local title="${1:-OpenCode}" msg="${2:-}" urgency="${3:-normal}" icon
   icon="$(normalize_icon "${4:-}")"
 
+  # Control characters are stripped from both free-text fields before anything is
+  # assembled. The hop payload below is delimited by newlines, so a title or a
+  # message carrying one would forge extra fields; this is what makes that
+  # delimiter unambiguous. It also keeps stray escapes off the desktop.
+  title="${title//[[:cntrl:]]/ }"
+  msg="${msg//[[:cntrl:]]/ }"
+
   # The port is per-host, so it must be resolved from the same place as the user
   # name. An explicit OC_TUNNEL_PORT still wins.
   if [[ -z "${OC_TUNNEL_PORT:-}" ]]; then
@@ -154,6 +162,14 @@ send_notify() {
     local -a target=(-p "$TUNNEL_PORT" "${hop_user}@localhost")
 
     if [[ -f "$HOME/.ssh/oc_notify" ]]; then
+      # ONE argument, not four. ssh concatenates everything after the host into
+      # the single command string that reaches the forced command as
+      # $SSH_ORIGINAL_COMMAND, with no positional parameters at all -- four
+      # arguments arrive as one space-joined blob the receiver cannot split, and
+      # the popup comes out empty. Newline-delimited fields survive that hop.
+      # oc-notify-receiver splits on exactly this; update the two together.
+      local payload="${title}"$'\n'"${msg}"$'\n'"${urgency}"$'\n'"${icon}"
+
       if ssh "${target[@]}" \
            -i "$HOME/.ssh/oc_notify" \
            -o IdentitiesOnly=yes \
@@ -161,7 +177,7 @@ send_notify() {
            -o BatchMode=yes \
            -o ConnectTimeout=5 \
            -o LogLevel=ERROR \
-           "$title" "$msg" "$urgency" "$icon" 2>/dev/null; then
+           -- "$payload" 2>/dev/null; then
         return 0
       fi
     else

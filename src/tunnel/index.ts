@@ -1,0 +1,266 @@
+// Portable notification transport.
+//
+// This is the GENERIC part of the author's `bin/oc` tunnel, extracted so it is
+// not welded to one person's SSH topology, one systemd unit per host, or one
+// per-host marker file. Those stay in `bin/oc*` and keep working exactly as
+// before; nothing in the published package depends on them.
+//
+// What is portable is the shape:
+//   * a notification is either local (notify straight to the desktop session) or
+//     remote (hand it to the desktop over an SSH reverse forward),
+//   * the hop passes ONE self-delimiting argument, never a shell string: ssh
+//     concatenates everything after the host into a single command string and a
+//     forced command is started with NO positional parameters, so separate
+//     arguments cannot survive the hop and one delimited blob can,
+//   * the only value interpolated into a notify-send call is the icon, and that
+//     is checked against a whitelist,
+//   * everything degrades. An unreachable remote, a missing key, a missing
+//     notify-send: all of them return a result, none of them throw, and the
+//     fire-and-forget path exits 0 regardless (US-14). A notification that
+//     cannot be delivered must never be able to fail the thing that tried to
+//     deliver it -- an agent must not go down because a laptop went to sleep.
+//
+// Nothing here knows how the tunnel is established. Configure it with the
+// environment (OC_LOCAL_USER, OC_TUNNEL_PORT, OC_NOTIFY_KEY) or by passing a
+// TunnelConfig; there is no discovery, no system probing, and no writes.
+
+import { spawnSync } from "node:child_process"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
+export type Urgency = "low" | "normal" | "critical"
+
+export type Icon =
+  | "utilities-terminal"
+  | "dialog-information"
+  | "dialog-error"
+  | "dialog-warning"
+  | "system-run"
+  | "emblem-default"
+
+/** The icon whitelist. Everything else collapses to the default. */
+export const ICONS: readonly Icon[] = [
+  "utilities-terminal",
+  "dialog-information",
+  "dialog-error",
+  "dialog-warning",
+  "system-run",
+  "emblem-default",
+] as const
+
+export type NotifyRequest = {
+  title: string
+  message?: string
+  urgency?: string
+  icon?: string
+}
+
+export type Result = { ok: boolean; detail?: string; transport: "local" | "remote" | "none" }
+
+export type TunnelConfig = {
+  /** The desktop user the reverse forward authenticates as. */
+  user: string
+  /** Port the reverse forward is listening on, local side. */
+  port: number
+  /** Dedicated key. Never a personal key: this one is restricted to notifying. */
+  key: string
+  /** Hard ceiling on the hop. A silent remote must not hold the caller. */
+  connectTimeoutMs: number
+}
+
+/**
+ * Every value has a default so a caller that knows nothing still gets something
+ * that works locally. Reading them from the environment (rather than probing
+ * `id -un`, or a per-host marker file) is what keeps this portable: on a remote
+ * account `id -un` is frequently root, which is never the desktop user.
+ */
+export function resolveTunnel(env: NodeJS.ProcessEnv = process.env): TunnelConfig {
+  const port = Number(env.OC_TUNNEL_PORT)
+  return {
+    user: env.OC_LOCAL_USER ?? "",
+    port: Number.isFinite(port) && port > 0 ? port : 10022,
+    key: env.OC_NOTIFY_KEY ?? join(homedir(), ".ssh", "lacode_notify"),
+    connectTimeoutMs: Number(env.OC_CONNECT_TIMEOUT_MS) || 5000,
+  }
+}
+
+/** True when this process is running on the other end of an SSH connection. */
+export function isRemote(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.SSH_CLIENT || env.SSH_TTY)
+}
+
+export function normalizeUrgency(raw: string | undefined): Urgency {
+  return raw === "low" || raw === "critical" || raw === "normal" ? raw : "normal"
+}
+
+export function normalizeIcon(raw: string | undefined): Icon {
+  return ICONS.includes(raw as Icon) ? (raw as Icon) : "utilities-terminal"
+}
+
+// Strip control characters and cap the length: both values are user-visible text
+// that lands on a desktop, and a session title is not trusted input.
+//
+// The \u0000-\u001f range includes \n, and the following collapse turns every
+// run of whitespace into one space. That is what makes `encodePayload` below
+// unambiguous: no field it writes can contain the newline it joins on.
+const safeText = (raw: string, fallback: string, max: number) => {
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim()
+  if (!clean) return fallback
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
+}
+
+export const safeTitle = (raw: string | undefined) => safeText(raw ?? "", "LaCode", 120)
+export const safeMessage = (raw: string | undefined) => safeText(raw ?? "", "", 400)
+
+/** The delimiter `encodePayload` joins fields with. Also what the receiver splits on. */
+export const FIELD_SEPARATOR = "\n"
+
+/**
+ * One argument, four newline-delimited fields: `title\nmessage\nurgency\nicon`.
+ *
+ * The single-argument shape is not a style choice, it is what the transport
+ * actually provides. ssh concatenates everything after the host into ONE command
+ * string and hands it to the forced command in $SSH_ORIGINAL_COMMAND with zero
+ * positional parameters -- verified against OpenSSH 10.5: `ssh host -- a b c d`
+ * yields `ARGC=0`. A four-argument sender therefore arrived as the single string
+ * `"a b c d"`, which the receiving end could only read as one field, so every
+ * field fell back to its default and the popup was blank.
+ *
+ * Newline is the delimiter because `safeText` above strips every control
+ * character (including \n) from both free-text fields, and the icon and urgency
+ * are whitelisted values. No field can contain the delimiter, so the split is
+ * lossless for a body containing spaces, quotes or glob characters.
+ */
+export const encodePayload = (request: NotifyRequest): string =>
+  [
+    safeTitle(request.title),
+    safeMessage(request.message),
+    normalizeUrgency(request.urgency),
+    normalizeIcon(request.icon),
+  ].join(FIELD_SEPARATOR)
+
+/**
+ * Options shared by every ssh call. `ClearAllForwardings=yes` matters: without
+ * it, a `RemoteForward` in ~/.ssh/config competes for the tunnel port and a
+ * half-claimed listener silently starves the one session that needed it.
+ */
+const SSH_OPTS = [
+  "-o", "BatchMode=yes",
+  "-o", "IdentitiesOnly=yes",
+  "-o", "ClearAllForwardings=yes",
+  "-o", "LogLevel=ERROR",
+  "-o", "StrictHostKeyChecking=accept-new",
+]
+
+const run = (command: string, args: string[], timeout: number) => {
+  try {
+    const result = spawnSync(command, args, { timeout, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+    return {
+      ok: result.status === 0,
+      stdout: result.stdout ?? "",
+      stderr: (result.stderr ?? "").trim(),
+      // spawnSync reports a timeout as a null status and an ETIMEDOUT error; both
+      // are "did not arrive", not "crashed", and neither may throw.
+      detail: result.error ? String((result.error as NodeJS.ErrnoException).code ?? result.error.message) : undefined,
+    }
+  } catch (error) {
+    return { ok: false, stdout: "", stderr: "", detail: String(error) }
+  }
+}
+
+const have = (command: string) => {
+  try {
+    return spawnSync("sh", ["-c", `command -v ${command}`], { encoding: "utf8" }).status === 0
+  } catch {
+    return false
+  }
+}
+
+/** Deliver straight to the local desktop session. Never throws. */
+export function sendLocal(request: NotifyRequest): Result {
+  if (!have("notify-send")) return { ok: false, detail: "notify-send is not installed", transport: "local" }
+  const args = [
+    safeTitle(request.title),
+    safeMessage(request.message),
+    `--urgency=${normalizeUrgency(request.urgency)}`,
+    `--icon=${normalizeIcon(request.icon)}`,
+  ]
+  const result = run("notify-send", args, 5000)
+  return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "local" }
+}
+
+/**
+ * Hand the notification to the desktop over the reverse forward.
+ *
+ * Exactly ONE argument crosses the hop, the newline-delimited payload from
+ * `encodePayload` -- not four quoted ARGV entries. The receiving end is an
+ * authorized_keys forced command restricted to exactly this, and that transport
+ * receives the command as a single string in $SSH_ORIGINAL_COMMAND with no
+ * positional parameters, so a per-field argument list arrives flattened and
+ * unreadable. A missing user, a missing key, an unreachable port: all return,
+ * none block for longer than connectTimeoutMs.
+ */
+export function sendRemote(request: NotifyRequest, tunnel: TunnelConfig): Result {
+  if (!tunnel.user) return { ok: false, detail: "OC_LOCAL_USER is unset; the desktop user for the tunnel is unknown", transport: "remote" }
+  const args = [
+    ...SSH_OPTS,
+    "-o", `ConnectTimeout=${Math.max(1, Math.round(tunnel.connectTimeoutMs / 1000))}`,
+    "-i", tunnel.key,
+    "-p", String(tunnel.port),
+    `${tunnel.user}@localhost`,
+    "--",
+    encodePayload(request),
+  ]
+  const result = run("ssh", args, tunnel.connectTimeoutMs + 2000)
+  return { ok: result.ok, detail: result.ok ? undefined : result.stderr || result.detail, transport: "remote" }
+}
+
+/**
+ * Send one notification, picking the transport by where we are running.
+ *
+ * Never throws (US-14). The caller decides what a failure means; the CLI's
+ * fire-and-forget path treats every result as exit 0.
+ */
+export function notify(request: NotifyRequest, env: NodeJS.ProcessEnv = process.env): Result {
+  try {
+    return isRemote(env) ? sendRemote(request, resolveTunnel(env)) : sendLocal(request)
+  } catch (error) {
+    return { ok: false, detail: String(error), transport: "none" }
+  }
+}
+
+/**
+ * Run a command on another host over SSH. This is the portable core of what
+ * `bin/oc-sync` does per host, without the deploy logic, the systemd units, the
+ * per-host marker file or the tunnel provisioning.
+ *
+ * Returns a result rather than throwing, and is bounded by `timeoutMs`, so a
+ * wedged remote cannot wedge the caller.
+ */
+export function forward(
+  host: string,
+  argv: string[],
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+): Result & { stdout: string } {
+  const env = options.env ?? process.env
+  const timeoutMs = options.timeoutMs ?? (Number(env.OC_SSH_TIMEOUT_MS) || 30_000)
+  const result = run("ssh", [...SSH_OPTS, "-o", `ConnectTimeout=${Math.max(1, Math.round(timeoutMs / 1000))}`, host, "--", ...argv], timeoutMs)
+  return {
+    ok: result.ok,
+    detail: result.ok ? undefined : result.stderr || result.detail,
+    transport: "remote",
+    stdout: result.stdout,
+  }
+}
+
+/** Print what the current environment resolves to. Diagnostics, never a gate. */
+export function describe(env: NodeJS.ProcessEnv = process.env) {
+  const tunnel = resolveTunnel(env)
+  return {
+    running: isRemote(env) ? "remote (over ssh)" : "local",
+    user: tunnel.user || "(unset)",
+    port: tunnel.port,
+    key: tunnel.key,
+    notifySend: have("notify-send"),
+  }
+}

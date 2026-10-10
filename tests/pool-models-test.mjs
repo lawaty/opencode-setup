@@ -1,4 +1,4 @@
-// pool-models.json is the one file a user edits to change which models the pool
+// presets/free-tier.json is the one file a user edits to change which models the pool
 // runs, and what share of the work each one takes. This suite drives the config
 // hook against temporary copies of that file and against the real opencode.jsonc,
 // proving:
@@ -25,8 +25,8 @@ import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
-const MODELS = join(HERE, "..", "pool-models.json")
-const PLUGIN = join(HERE, "..", "plugins", "agent-pool.ts")
+const MODELS = join(HERE, "..", "presets", "free-tier.json")
+const PLUGIN = join(HERE, "..", "src", "plugins", "agent-pool.ts")
 const realCfg = () => JSON.parse(readFileSync(CONFIG, "utf8"))
 
 // Each pool instance gets its own log buffer: warnOnce state is per instance, so
@@ -35,8 +35,8 @@ const makeClient = () => {
   const lines = []
   return { lines, client: { app: { log: async ({ body }) => void lines.push(`${body.level} ${body.message}`) } } }
 }
-const pool = await import(join(HERE, "..", "lib", "pool.ts"))
-const { AgentPool } = await import(PLUGIN)
+const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const { agentPoolHooks: AgentPool } = await import(PLUGIN)
 
 const assert = (cond, msg) => {
   if (!cond) {
@@ -74,7 +74,7 @@ const BASES = ["explore-fast", "implement-fast", "context-manager"]
 
 // 1. the shipped file is well formed
 const shipped = JSON.parse(readFileSync(MODELS, "utf8"))
-assert(Array.isArray(shipped.slots) && shipped.slots.length >= 2, "pool-models.json must list at least two slots")
+assert(Array.isArray(shipped.slots) && shipped.slots.length >= 2, "presets/free-tier.json must list at least two slots")
 const ids = new Set()
 shipped.slots.forEach((slot, i) => {
   assert(typeof slot.model === "string" && slot.model.includes("/"), `slot ${i + 1} needs a provider/model-id`)
@@ -159,7 +159,7 @@ const broken = await apply(
   }),
   "broken",
 )
-const warns = broken.warned().filter((l) => l.includes("pool-models.json") || l.includes("slot "))
+const warns = broken.warned().filter((l) => l.includes("presets/free-tier.json") || l.includes("slot "))
 assert(warns.length === 3, `each bad entry should warn once, got ${warns.length}: ${warns.join(" | ")}`)
 assert(warns.some((l) => l.includes("weight must be a number")), `a bad weight should warn, got ${warns.join(" | ")}`)
 // the model behind the bad weight survives, only its preference is lost
@@ -243,7 +243,7 @@ assert(
   new Set(capPicks).size === pool.MAX_SLOTS && !capPicks.includes(String(pool.MAX_SLOTS + 1)),
   `only the first ${pool.MAX_SLOTS} slots may route, got ${[...new Set(capPicks)].join(",")}`,
 )
-assert(shipped.slots.length <= pool.MAX_SLOTS, `pool-models.json lists ${shipped.slots.length} slots, over the ${pool.MAX_SLOTS} cap`)
+assert(shipped.slots.length <= pool.MAX_SLOTS, `presets/free-tier.json lists ${shipped.slots.length} slots, over the ${pool.MAX_SLOTS} cap`)
 const shippedVariants = Object.keys(realCfg().agent).filter((n) => /-[5-9]$/.test(n))
 assert(shippedVariants.length === 0, `opencode.jsonc must not declare a variant beyond the cap, got ${shippedVariants.join(", ")}`)
 

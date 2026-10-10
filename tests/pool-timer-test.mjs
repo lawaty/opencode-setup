@@ -13,11 +13,11 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const CONFIG = join(HERE, "..", "opencode.jsonc")
 const cfg = JSON.parse(readFileSync(CONFIG, "utf8"))
 
-// pool-models.json owns the pool's models. Test 4 is about a provider-wide
+// presets/free-tier.json owns the pool's models. Test 4 is about a provider-wide
 // cooldown, so it is written against whichever provider slot 1 runs on and the
 // slots on the other providers, rather than against fixed model names.
-const { splitModel } = await import(join(HERE, "..", "lib", "pool.ts"))
-const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "pool-models.json"), "utf8")).slots
+const { splitModel } = await import(join(HERE, "..", "src", "lib", "pool.ts"))
+const SLOTS = JSON.parse(readFileSync(join(HERE, "..", "presets", "free-tier.json"), "utf8")).slots
 const { provider: HOT_PROVIDER, id: HOT_MODEL } = splitModel(SLOTS[0].model) // provider whose free tier fills up
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 const sameProvider = SLOTS.filter((s) => s.model.startsWith(`${HOT_PROVIDER}/`)).map((s) => s.model)
@@ -48,8 +48,8 @@ globalThis.fetch = async (url) => {
 
 const logs = []
 const client = { app: { log: async ({ body }) => logs.push(`${body.level} ${body.message}`) } }
-const { AgentPool } = await import(join(HERE, "..", "plugins", "agent-pool.ts"))
-const pool = await import(join(HERE, "..", "lib", "pool.ts"))
+const { agentPoolHooks: AgentPool } = await import(join(HERE, "..", "src", "plugins", "agent-pool.ts"))
+const pool = await import(join(HERE, "..", "src", "lib", "pool.ts"))
 
 const REAL = Date.now()
 let clock = 0

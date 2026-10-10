@@ -96,12 +96,28 @@ check("oc builds no remote notify-send command string", () => {
   assert(!/\bid -u\b/.test(inSendNotify), "send_notify must not expand id -u remotely")
 })
 
-check("oc sends the notification as argv, not a shell string", () => {
+check("oc sends the notification as ONE newline-delimited argument, not as argv", () => {
+  // The old four-argument hop looked right and delivered nothing: ssh
+  // concatenates everything after the host into a single command string, and
+  // the forced command is started with NO positional parameters, so
+  // "$title" "$msg" "$urgency" "$icon" arrived as one space-joined blob the
+  // receiver could not split -- four defaults, and an empty popup.
   const src = read("oc")
   const hop = src.slice(src.indexOf("if [[ -n \"${SSH_CLIENT"), src.indexOf("else\n    # Local"))
-  assert(/\$title\$|\$title"/.test(hop), "the tunnel hop should pass title as an argument")
-  assert(/"\$title" "\$msg" "\$urgency" "\$icon"/.test(hop),
-    "the tunnel hop should pass all four values as quoted arguments")
+  assert(/local payload=/.test(hop), "the hop should assemble a single payload variable")
+  assert(/payload="\$\{title\}"\$'\\n'/.test(hop), "the payload should join the fields with newlines")
+  assert(/-- "\$payload"/.test(hop), "the hop should pass exactly that one argument after --")
+  assert(!/"\$title" "\$msg"/.test(hop), "the hop must no longer pass four separate arguments")
+})
+
+check("the hop payload strips the delimiter from the fields it joins on", () => {
+  // Newline is the delimiter, so a title or message carrying one would forge
+  // extra fields. The payload is only self-delimiting if both are stripped
+  // first -- this is the property that makes the single-argument form safe.
+  const src = read("oc")
+  const body = src.slice(src.indexOf("send_notify()"), src.indexOf("# oc-notify reuses"))
+  assert(/title="\$\{title\/\/\[\[:cntrl:\]\]\/ \}"/.test(body), "the title must lose control characters before the payload is built")
+  assert(/msg="\$\{msg\/\/\[\[:cntrl:\]\]\/ \}"/.test(body), "the message must lose control characters too")
 })
 
 check("oc uses the dedicated tunnel key, never a personal key", () => {
@@ -209,6 +225,29 @@ check("oc-notify does not start opencode", () => {
 // ---------------------------------------------------------------------------
 // oc-notify-receiver: what the tunnel key is allowed to do
 // ---------------------------------------------------------------------------
+
+check("receiver reads the payload from SSH_ORIGINAL_COMMAND, never from $1..$4", () => {
+  // The bug this pins: an authorized_keys forced command is started with no
+  // arguments of its own, so "$1" is always empty and every field fell back to
+  // its default -- an empty popup on the desktop with nothing in the logs.
+  const src = read("oc-notify-receiver")
+  assert(/SSH_ORIGINAL_COMMAND/.test(src), "the receiver should read the payload from the environment")
+  assert(/mapfile -t fields/.test(src), "it should split on newlines with mapfile, not word splitting")
+  assert(!/\$\{1:-/.test(src) && !/\$\{2:-/.test(src), "it must not read positional parameters: ssh passes none")
+})
+
+check("receiver never evaluates the payload, and says why", () => {
+  // $SSH_ORIGINAL_COMMAND is attacker-controlled and this runs as the desktop
+  // user. The comment is load-bearing: without it the next reader "simplifies"
+  // the parse back into an eval and reopens remote code execution on the local
+  // desktop session.
+  const src = read("oc-notify-receiver")
+  const code = src.replace(/^\s*#.*$/gm, "").replace(/^\s*$/gm, "")
+  assert(!/eval /.test(code), "the receiver must not eval the payload")
+  assert(!/sh -c /.test(code), "the receiver must not hand the payload to a shell")
+  assert(/NEVER `eval/.test(src), "the reason must be written down where a reader will hit it")
+  assert(/ATTACKER-CONTROLLED/.test(src), "the comment must name the threat")
+})
 
 check("receiver validates urgency against a whitelist", () => {
   const src = read("oc-notify-receiver")
